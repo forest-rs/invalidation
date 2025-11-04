@@ -1,0 +1,26 @@
+[package]
+name = "understory_benches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+understory_index = { path = "../understory_index" }
+rstar = { version = "0.11", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[features]
+compare_rstar = ["dep:rstar"]
+
+[[bench]]
+name = "index_compare_backends"
+harness = false
+
+[[bench]]
+name = "rtree_external_compare"
+harness = false
+required-features = ["compare_rstar"]
