@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "benches",
     "crates/invalidation",
 ]
 
@@ -65,3 +66,6 @@ clippy.wildcard_dependencies = "warn"
 clippy.allow_attributes = "warn"
 
 [workspace.dependencies]
+hashbrown = { default-features = false, features = [
+    "default-hasher",
+], version = "0.16.1" }

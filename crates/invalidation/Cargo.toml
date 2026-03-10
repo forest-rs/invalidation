@@ -5,16 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared identifiers and retrieval vocabulary for the Leit kernel."
+description = "Generic invalidation primitives"
 readme = "README.md"
-keywords = ["leit", "search", "retrieval", "kernel"]
+keywords = ["invalidation", "incremental", "no_std"]
 categories = ["algorithms", "data-structures"]
 
-[features]
-default = []
-std = []
-
 [dependencies]
+hashbrown.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
