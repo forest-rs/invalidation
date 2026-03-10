@@ -1,0 +1,20 @@
+[package]
+name = "invalidation"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared identifiers and retrieval vocabulary for the Leit kernel."
+readme = "README.md"
+keywords = ["leit", "search", "retrieval", "kernel"]
+categories = ["algorithms", "data-structures"]
+
+[features]
+default = []
+std = []
+
+[dependencies]
+
+[lints]
+workspace = true
