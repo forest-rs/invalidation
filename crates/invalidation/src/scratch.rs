@@ -2,6 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Reusable scratch buffers for graph traversals.
+//!
+//! `TraversalScratch` is the simplest way to keep repeated eager traversals
+//! from allocating on every call.
+//!
+//! ```
+//! use invalidation::{
+//!     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, TraversalScratch,
+//! };
+//!
+//! const LAYOUT: Channel = Channel::new(0);
+//!
+//! let mut graph = InvalidationGraph::<u32>::new();
+//! graph.add_dependency(2, 1, LAYOUT, CycleHandling::Error).unwrap();
+//! graph.add_dependency(3, 2, LAYOUT, CycleHandling::Error).unwrap();
+//!
+//! let mut invalidated = InvalidationSet::new();
+//! let mut scratch = TraversalScratch::with_capacity(8);
+//!
+//! for root in [1, 2] {
+//!     EagerPolicy.propagate_with_scratch(root, LAYOUT, &graph, &mut invalidated, &mut scratch);
+//! }
+//!
+//! assert!(invalidated.is_invalidated(1, LAYOUT));
+//! assert!(invalidated.is_invalidated(2, LAYOUT));
+//! assert!(invalidated.is_invalidated(3, LAYOUT));
+//! ```
 
 use alloc::vec::Vec;
 use core::hash::Hash;

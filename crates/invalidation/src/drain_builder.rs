@@ -12,6 +12,16 @@
 //!
 //! - Default order: `Any` (no `Ord` bound).
 //! - Deterministic order: opt in via [`DrainBuilder::deterministic`] (requires `K: Ord + DenseKey`).
+//!
+//! Reach for `DrainBuilder` when the one-shot helpers are too narrow:
+//!
+//! - `drain_sorted` for “all currently invalidated keys”
+//! - `drain_affected_sorted` for “roots plus dependents”
+//! - `DrainBuilder` when you also need targeted scope, deterministic ordering,
+//!   scratch reuse, or trace capture
+//!
+//! `DrainBuilder` is intentionally additive: the extra trait bounds and work
+//! only appear for the capabilities you opt into.
 
 use alloc::vec::Vec;
 use core::hash::Hash;

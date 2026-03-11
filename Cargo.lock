@@ -179,10 +179,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "invalidation_benches"
+name = "invalidation_examples"
 version = "0.1.0"
 dependencies = [
- "criterion",
  "invalidation",
 ]
 
@@ -388,6 +387,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "wind_tunnel"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "invalidation",
 ]
 
 [[package]]

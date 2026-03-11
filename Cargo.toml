@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "benches",
     "crates/invalidation",
+    "examples",
+    "wind_tunnel",
 ]
 
 [workspace.package]
 edition = "2024"
+# Keep in sync with RUST_MIN_VER in .github/workflows/ci.yml, with the relevant README.md files
+# and with the MSRV in the `Unreleased` section of CHANGELOG.md.
 rust-version = "1.92"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/forest-rs/invalidation"
@@ -69,3 +72,4 @@ clippy.allow_attributes = "warn"
 hashbrown = { default-features = false, features = [
     "default-hasher",
 ], version = "0.16.1" }
+invalidation = { path = "crates/invalidation" }

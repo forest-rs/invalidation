@@ -11,9 +11,9 @@ env:
   RUST_MIN_VER: "1.92"
   # List of packages that will be checked with the minimum supported Rust version.
   # This should be limited to packages that are intended for publishing.
-  RUST_MIN_VER_PKGS:
+  RUST_MIN_VER_PKGS: "-p invalidation"
   # List of packages that don't support `no_std`.
-  RUST_STD_ONLY_PKGS:
+  RUST_STD_ONLY_PKGS: "--exclude invalidation_examples --exclude wind_tunnel"
   # List of packages that don't support wasip1
   RUST_NO_WASIP1_PKGS:
   # List of packages that don't support wasm32
@@ -132,7 +132,7 @@ jobs:
         run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
 
       - name: cargo clippy (auxiliary)
-        run: cargo hack clippy ${{ env.RUST_STD_ONLY_PKGS }} --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
 
   clippy-stable-wasm:
     name: cargo clippy (wasm32)

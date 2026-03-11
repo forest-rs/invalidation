@@ -14,6 +14,27 @@
 //!
 //! If you need “all roots / all paths”, that is a separate, explicitly-scoped
 //! feature: it can be much more expensive in both time and memory.
+//!
+//! ```
+//! use invalidation::{
+//!     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, OneParentRecorder,
+//!     TraversalScratch,
+//! };
+//!
+//! const LAYOUT: Channel = Channel::new(0);
+//!
+//! let mut graph = InvalidationGraph::<u32>::new();
+//! graph.add_dependency(2, 1, LAYOUT, CycleHandling::Error).unwrap();
+//! graph.add_dependency(3, 2, LAYOUT, CycleHandling::Error).unwrap();
+//!
+//! let mut invalidated = InvalidationSet::new();
+//! let mut scratch = TraversalScratch::new();
+//! let mut trace = OneParentRecorder::new();
+//!
+//! EagerPolicy.propagate_with_trace(1, LAYOUT, &graph, &mut invalidated, &mut scratch, &mut trace);
+//!
+//! assert_eq!(trace.explain_path(3, LAYOUT), Some(vec![1, 2, 3]));
+//! ```
 
 use alloc::vec::Vec;
 use core::hash::Hash;
@@ -55,6 +76,30 @@ pub trait InvalidationTrace<K> {
 ///
 /// This stores a best-effort explanation path for *some* cause chain. When a
 /// key has multiple possible upstream causes, the first one observed wins.
+///
+/// # Example
+///
+/// ```
+/// use invalidation::{
+///     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, OneParentRecorder,
+///     TraversalScratch,
+/// };
+///
+/// const LAYOUT: Channel = Channel::new(0);
+///
+/// let mut graph = InvalidationGraph::<u32>::new();
+/// graph.add_dependency(2, 1, LAYOUT, CycleHandling::Error).unwrap();
+/// graph.add_dependency(3, 2, LAYOUT, CycleHandling::Error).unwrap();
+///
+/// let mut invalidated = InvalidationSet::new();
+/// let mut scratch = TraversalScratch::new();
+/// let mut trace = OneParentRecorder::new();
+///
+/// EagerPolicy.propagate_with_trace(1, LAYOUT, &graph, &mut invalidated, &mut scratch, &mut trace);
+///
+/// assert_eq!(trace.cause(1, LAYOUT), Some(invalidation::InvalidationCause::Root));
+/// assert_eq!(trace.explain_path(3, LAYOUT), Some(vec![1, 2, 3]));
+/// ```
 #[derive(Debug, Default, Clone)]
 pub struct OneParentRecorder<K>
 where

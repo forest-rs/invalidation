@@ -1,7 +1,7 @@
 // Copyright 2026 the Invalidation Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Invalidation: generic invalidation and invalidation primitives.
+//! Invalidation: generic primitives for dependency-aware invalidation.
 //!
 //! This crate provides building blocks for incremental computation systems
 //! where changes to upstream data must propagate to downstream consumers.
@@ -20,6 +20,9 @@
 //!   keys in dependency order.
 //! - **Scratch buffers** ([`TraversalScratch`]): Reusable traversal state for
 //!   tight loops to avoid repeated allocations.
+//!
+//! This crate owns invalidation primitives. It explicitly does not own
+//! recomputation, caching, or scheduling policy.
 //!
 //! ## Quick Start
 //!
@@ -48,6 +51,16 @@
 //!     let _ = key;
 //! }
 //! ```
+//!
+//! ## Choosing An API
+//!
+//! - Use [`InvalidationTracker`] for the common “graph + set together” workflow.
+//! - Use [`InvalidationGraph`] plus [`InvalidationSet`] separately if your
+//!   embedder already owns invalidation state and just wants the primitives.
+//! - Use [`DrainBuilder`] when you need deterministic drains, targeted drains,
+//!   scratch reuse, or tracing.
+//! - Use [`intern::Interner`] when your natural keys are not already compact
+//!   `Copy` identifiers.
 //!
 //! ## Using Components Separately
 //!
@@ -99,6 +112,8 @@
 //!   that are currently marked invalidated, in topological order.
 //! - [`drain_affected_sorted`] / [`InvalidationTracker::drain_affected_sorted`]:
 //!   Expand the invalidation set to include all transitive dependents before draining.
+//! - [`DrainBuilder`]: Configure ordering, scope, scratch reuse, and tracing in
+//!   one place.
 //!
 //! ## Cycle Detection
 //!
@@ -113,6 +128,15 @@
 //! ## `no_std` Support
 //!
 //! This crate is `no_std` and uses `alloc`. It does not depend on `std`.
+//!
+//! ## Common Mistakes
+//!
+//! - `add_dependency(a, b, ...)` means `a` depends on `b`.
+//! - [`LazyPolicy`] is usually paired with affected drains, not plain
+//!   [`drain_sorted`].
+//! - Deterministic dense drains assume a compact key space; intern sparse or
+//!   structured keys first.
+//! - If cycles are allowed, topological drains can stall.
 
 #![no_std]
 
