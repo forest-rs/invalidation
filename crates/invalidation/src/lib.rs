@@ -142,7 +142,9 @@
 
 extern crate alloc;
 
+mod cascade;
 mod channel;
+mod cross_channel;
 mod drain;
 mod drain_builder;
 mod graph;
@@ -153,7 +155,9 @@ mod set;
 pub mod trace;
 mod tracker;
 
+pub use cascade::{CascadeCycleError, ChannelCascade};
 pub use channel::{Channel, ChannelSet, ChannelSetIter};
+pub use cross_channel::CrossChannelEdges;
 pub use drain::{
     DenseKey, DrainCompletion, DrainSorted, DrainSortedDeterministic, drain_affected_sorted,
     drain_affected_sorted_deterministic, drain_affected_sorted_with_trace, drain_sorted,
