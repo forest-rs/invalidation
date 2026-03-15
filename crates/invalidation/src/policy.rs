@@ -19,6 +19,11 @@ use crate::trace::InvalidationTrace;
 /// to immediately propagate to all dependents (eager), defer propagation
 /// (lazy), or implement custom strategies.
 ///
+/// A [`PropagationPolicy`] only controls same-channel propagation. When used
+/// with [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with),
+/// any cross-channel follow-up is performed by the tracker after the policy has
+/// marked keys in the current channel.
+///
 /// # Example
 ///
 /// ```
@@ -49,15 +54,22 @@ where
 {
     /// Propagates invalidation from `key` through the dependency graph.
     ///
-    /// This method is called after `key` has been marked invalidated. The policy
-    /// should mark any additional keys that should become invalidated as a result.
+    /// The policy is responsible for marking `key` itself and any dependents
+    /// it determines should become invalidated. Both built-in policies
+    /// ([`EagerPolicy`], [`LazyPolicy`]) mark the root key; custom
+    /// implementations should do the same.
+    ///
+    /// This trait does not directly control cross-channel traversal. In
+    /// [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with),
+    /// cross-channel follow-up is only defined for the root key and for keys
+    /// that are graph-reachable on the current channel and actually marked.
     ///
     /// # Parameters
     ///
-    /// - `key`: The key that was just marked invalidated.
-    /// - `channel`: The channel in which the key is invalidated.
+    /// - `key`: The key to mark invalidated and propagate from.
+    /// - `channel`: The channel in which invalidation occurs.
     /// - `graph`: The dependency graph (read-only).
-    /// - `invalidated`: The invalidation set to mark additional keys in.
+    /// - `invalidated`: The invalidation set to mark keys in.
     fn propagate(
         &self,
         key: K,

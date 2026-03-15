@@ -18,6 +18,10 @@
 //!   Pluggable strategies for how invalidation spreads through the graph.
 //! - **Topological drain** ([`DrainSorted`]): Kahn's algorithm to yield invalidated
 //!   keys in dependency order.
+//! - **Channel cascades** ([`ChannelCascade`]): DAG of "invalidation on channel A
+//!   also marks channel B" rules, with precomputed transitive closure.
+//! - **Cross-channel edges** ([`CrossChannelEdges`]): Sparse `(key, channel) →
+//!   (key, channel)` edges for cross-key cross-channel dependencies.
 //! - **Scratch buffers** ([`TraversalScratch`]): Reusable traversal state for
 //!   tight loops to avoid repeated allocations.
 //!

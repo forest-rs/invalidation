@@ -119,11 +119,7 @@ impl ChannelCascade {
     /// create a cycle.
     ///
     /// Self-cascades (`from == to`) are treated as cycles.
-    pub fn add_cascade(
-        &mut self,
-        from: Channel,
-        to: Channel,
-    ) -> Result<bool, CascadeCycleError> {
+    pub fn add_cascade(&mut self, from: Channel, to: Channel) -> Result<bool, CascadeCycleError> {
         // Self-cascade is a trivial cycle.
         if from == to {
             return Err(CascadeCycleError { from, to });
@@ -209,7 +205,7 @@ impl ChannelCascade {
             let targets = self.direct[ch.index() as usize];
             // Add targets that haven't been visited.
             let new_targets = targets & !visited;
-            queue = queue | new_targets;
+            queue |= new_targets;
         }
 
         false
@@ -226,12 +222,12 @@ impl ChannelCascade {
             let mut frontier = self.direct[i];
 
             while !frontier.is_empty() {
-                reachable = reachable | frontier;
+                reachable |= frontier;
                 let mut next_frontier = ChannelSet::EMPTY;
                 for ch in frontier {
                     // Add direct targets of `ch` that aren't already reachable.
                     let targets = self.direct[ch.index() as usize] & !reachable;
-                    next_frontier = next_frontier | targets;
+                    next_frontier |= targets;
                 }
                 frontier = next_frontier;
             }

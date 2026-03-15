@@ -3,9 +3,12 @@
 
 //! Combined invalidation tracker: graph + set convenience type.
 
+use alloc::vec::Vec;
 use core::hash::Hash;
 
+use crate::cascade::{CascadeCycleError, ChannelCascade};
 use crate::channel::Channel;
+use crate::cross_channel::CrossChannelEdges;
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
 use crate::drain_builder::{AnyOrder, DrainBuilder};
 use crate::graph::{CycleError, CycleHandling, InvalidationGraph};
@@ -66,6 +69,10 @@ where
     invalidated: InvalidationSet<K>,
     /// How to handle cycles when adding dependencies.
     cycle_handling: CycleHandling,
+    /// Channel-to-channel cascade rules.
+    cascade: ChannelCascade,
+    /// Cross-channel edges connecting (key, channel) pairs.
+    cross_channel: CrossChannelEdges<K>,
 }
 
 impl<K> Default for InvalidationTracker<K>
@@ -139,6 +146,8 @@ where
             graph: InvalidationGraph::new(),
             invalidated: InvalidationSet::new(),
             cycle_handling,
+            cascade: ChannelCascade::new(),
+            cross_channel: CrossChannelEdges::new(),
         }
     }
     /// Returns a reference to the underlying dependency graph.
@@ -230,12 +239,13 @@ where
         self.graph.remove_dependency(from, to, channel)
     }
 
-    /// Removes a key from both the graph and the invalidation set.
+    /// Removes a key from the graph, invalidation set, and cross-channel edges.
     ///
     /// This is useful when a node is removed from the tree entirely.
     pub fn remove_key(&mut self, key: K) {
         self.graph.remove_key(key);
         self.invalidated.remove_key(key);
+        self.cross_channel.remove_key(key);
     }
 
     /// Replaces all direct dependencies of `from` in `channel`.
@@ -268,26 +278,184 @@ where
     }
 
     // -------------------------------------------------------------------------
+    // Channel cascade operations
+    // -------------------------------------------------------------------------
+
+    /// Adds a channel cascade rule: invalidation on `from` also marks `to`.
+    ///
+    /// Returns `Ok(true)` if the rule was newly added, `Ok(false)` if it
+    /// already existed, or `Err(CascadeCycleError)` if adding the rule would
+    /// create a cycle.
+    ///
+    /// See [`ChannelCascade::add_cascade`] for details.
+    pub fn add_cascade(&mut self, from: Channel, to: Channel) -> Result<bool, CascadeCycleError> {
+        self.cascade.add_cascade(from, to)
+    }
+
+    /// Removes a channel cascade rule.
+    ///
+    /// Returns `true` if the rule existed and was removed.
+    pub fn remove_cascade(&mut self, from: Channel, to: Channel) -> bool {
+        self.cascade.remove_cascade(from, to)
+    }
+
+    /// Returns a reference to the channel cascade rules.
+    #[inline]
+    #[must_use]
+    pub fn cascade(&self) -> &ChannelCascade {
+        &self.cascade
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-channel edge operations
+    // -------------------------------------------------------------------------
+
+    /// Adds a cross-channel dependency edge.
+    ///
+    /// When `from_key` is invalidated on `from_ch`, `to_key` will also be
+    /// marked on `to_ch` (when using [`mark_with`](Self::mark_with)).
+    ///
+    /// Returns `true` if the edge was newly added.
+    pub fn add_cross_dependency(
+        &mut self,
+        from_key: K,
+        from_ch: Channel,
+        to_key: K,
+        to_ch: Channel,
+    ) -> bool {
+        self.cross_channel
+            .add_edge(from_key, from_ch, to_key, to_ch)
+    }
+
+    /// Removes a cross-channel dependency edge.
+    ///
+    /// Returns `true` if the edge existed and was removed.
+    pub fn remove_cross_dependency(
+        &mut self,
+        from_key: K,
+        from_ch: Channel,
+        to_key: K,
+        to_ch: Channel,
+    ) -> bool {
+        self.cross_channel
+            .remove_edge(from_key, from_ch, to_key, to_ch)
+    }
+
+    /// Returns a reference to the cross-channel edges.
+    #[inline]
+    #[must_use]
+    pub fn cross_channel(&self) -> &CrossChannelEdges<K> {
+        &self.cross_channel
+    }
+
+    // -------------------------------------------------------------------------
     // Invalidation marking
     // -------------------------------------------------------------------------
 
     /// Marks a key as invalidated without propagation.
     ///
-    /// Returns `true` if the key was newly marked invalidated.
+    /// When cascade rules are configured, also marks the key on all
+    /// transitively cascaded channels.
+    ///
+    /// Returns `true` if the key was newly marked invalidated on the
+    /// primary channel (cascade marks are not reflected in the return value).
     #[inline]
     pub fn mark(&mut self, key: K, channel: Channel) -> bool {
-        self.invalidated.mark(key, channel)
+        let result = self.invalidated.mark(key, channel);
+        let cascaded = self.cascade.cascades_from(channel);
+        if !cascaded.is_empty() {
+            for ch in cascaded {
+                self.invalidated.mark(key, ch);
+            }
+        }
+        result
     }
 
     /// Marks a key as invalidated using the given propagation policy.
     ///
     /// The policy determines how invalidation spreads through the dependency
     /// graph. See [`PropagationPolicy`] for details.
+    ///
+    /// When cascade rules or cross-channel edges are configured, `mark_with`
+    /// extends propagation across channels:
+    ///
+    /// 1. Runs the policy on `(key, channel)` and all cascaded channels.
+    /// 2. For the root key and every key reachable via
+    ///    [`InvalidationGraph::transitive_dependents`] that was actually
+    ///    marked, follows cascade rules and cross-channel edges.
+    /// 3. Repeats until no new `(key, channel)` pairs are discovered.
+    ///
+    /// This covers the built-in policies completely: [`EagerPolicy`](crate::EagerPolicy)
+    /// marks exactly the graph-reachable dependents, and [`LazyPolicy`](crate::LazyPolicy)
+    /// marks only the root. For custom policies, cross-channel follow-up is
+    /// only defined for the root key and for graph-reachable keys on that
+    /// channel that the policy actually marked. Keys marked outside the
+    /// graph's reachability set will not have their cascade or cross-channel
+    /// edges followed automatically.
+    ///
+    /// When no cascades or cross-channel edges are configured, this reduces
+    /// to a single `policy.propagate()` call with no extra overhead.
     pub fn mark_with<P>(&mut self, key: K, channel: Channel, policy: &P)
     where
         P: PropagationPolicy<K>,
     {
-        policy.propagate(key, channel, &self.graph, &mut self.invalidated);
+        // Fast path: no cascades, no cross-channel edges — pure single-channel.
+        if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
+            policy.propagate(key, channel, &self.graph, &mut self.invalidated);
+            return;
+        }
+
+        // Slow path: unified closure across channels.
+        //
+        // Worklist of (key, channel) pairs to propagate. For each pair we:
+        // 1. Run the policy (same-channel propagation).
+        // 2. For each key that ended up invalidated on that channel
+        //    (root + dependents), check cascades and cross-channel edges.
+        // 3. Enqueue any new (key, channel) pairs discovered.
+        let mut worklist: Vec<(K, Channel)> = Vec::new();
+        worklist.push((key, channel));
+        let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
+
+        while let Some((k, ch)) = worklist.pop() {
+            if !processed.insert((k, ch)) {
+                continue;
+            }
+
+            // 1. Run the propagation policy on this (key, channel).
+            policy.propagate(k, ch, &self.graph, &mut self.invalidated);
+
+            // 2. Discover cascade/cross-channel targets from k and all of
+            //    its transitive dependents that were actually marked.
+            let ch_cascaded = self.cascade.cascades_from(ch);
+            let has_cross = !self.cross_channel.is_empty();
+
+            // Enqueue cascade + cross-channel targets for k itself.
+            Self::enqueue_cross_targets(
+                k,
+                ch,
+                ch_cascaded,
+                has_cross,
+                &self.cross_channel,
+                &processed,
+                &mut worklist,
+            );
+
+            // Enqueue targets for each transitive dependent of k on ch
+            // that was actually marked (eager marks them, lazy does not).
+            for dep in self.graph.transitive_dependents(k, ch) {
+                if self.invalidated.is_invalidated(dep, ch) {
+                    Self::enqueue_cross_targets(
+                        dep,
+                        ch,
+                        ch_cascaded,
+                        has_cross,
+                        &self.cross_channel,
+                        &processed,
+                        &mut worklist,
+                    );
+                }
+            }
+        }
     }
 
     /// Returns `true` if the key is invalidated in the given channel.
@@ -440,6 +608,130 @@ where
     pub fn clear_all(&mut self) {
         self.invalidated.clear_all();
     }
+
+    // -------------------------------------------------------------------------
+    // Multi-channel drain
+    // -------------------------------------------------------------------------
+
+    /// Drains invalidated keys across channels in the given order.
+    ///
+    /// Within each channel, keys are yielded in topological order (like
+    /// [`drain_sorted`](Self::drain_sorted)). Results are tagged with their
+    /// channel.
+    ///
+    /// Channels with no invalidated keys are silently skipped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{Channel, InvalidationTracker, EagerPolicy};
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    /// const PAINT: Channel = Channel::new(1);
+    ///
+    /// let mut tracker = InvalidationTracker::<u32>::new();
+    /// tracker.add_dependency(2, 1, LAYOUT).unwrap();
+    /// tracker.mark_with(1, LAYOUT, &EagerPolicy);
+    /// tracker.mark(5, PAINT);
+    ///
+    /// let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+    /// assert_eq!(results, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
+    /// ```
+    pub fn drain_channels_sorted(&mut self, order: &[Channel]) -> Vec<(Channel, K)> {
+        let mut results = Vec::new();
+        for &ch in order {
+            for key in self.drain_sorted(ch) {
+                results.push((ch, key));
+            }
+        }
+        results
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-channel queries
+    // -------------------------------------------------------------------------
+
+    /// Returns all transitive dependents following same-channel edges,
+    /// cascades, and cross-channel edges.
+    ///
+    /// At each visited `(key, channel)` the traversal:
+    /// 1. Follows same-channel dependents from the [`InvalidationGraph`].
+    /// 2. Applies cascade rules (same key, cascaded channels).
+    /// 3. Follows cross-channel edges from [`CrossChannelEdges`].
+    ///
+    /// The iteration order is not specified and may vary across runs.
+    /// The result is collected into a `Vec` to avoid complex iterator
+    /// lifetime issues.
+    pub fn transitive_dependents_cross(&self, key: K, channel: Channel) -> Vec<(K, Channel)> {
+        use hashbrown::HashSet;
+
+        let mut visited = HashSet::new();
+        let mut queue = Vec::new();
+        let mut result = Vec::new();
+
+        // Seed with (key, channel).
+        queue.push((key, channel));
+        visited.insert((key, channel));
+
+        while let Some((k, ch)) = queue.pop() {
+            // 1. Same-channel dependents.
+            for dep in self.graph.dependents(k, ch) {
+                if visited.insert((dep, ch)) {
+                    result.push((dep, ch));
+                    queue.push((dep, ch));
+                }
+            }
+
+            // 2. Cascade channels (same key, different channels).
+            let cascaded = self.cascade.cascades_from(ch);
+            for cascade_ch in cascaded {
+                if visited.insert((k, cascade_ch)) {
+                    result.push((k, cascade_ch));
+                    queue.push((k, cascade_ch));
+                }
+            }
+
+            // 3. Cross-channel edges.
+            for (dep_key, dep_ch) in self.cross_channel.dependents(k, ch) {
+                if visited.insert((dep_key, dep_ch)) {
+                    result.push((dep_key, dep_ch));
+                    queue.push((dep_key, dep_ch));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Enqueues cascade and cross-channel targets for a single key into the
+    /// worklist, skipping already-processed pairs.
+    fn enqueue_cross_targets(
+        key: K,
+        channel: Channel,
+        ch_cascaded: crate::channel::ChannelSet,
+        has_cross: bool,
+        cross_channel: &CrossChannelEdges<K>,
+        processed: &hashbrown::HashSet<(K, Channel)>,
+        worklist: &mut Vec<(K, Channel)>,
+    ) {
+        // Cascade targets: same key, cascaded channels.
+        for cascade_ch in ch_cascaded {
+            if !processed.contains(&(key, cascade_ch)) {
+                worklist.push((key, cascade_ch));
+            }
+        }
+
+        // Cross-channel edge targets.
+        if has_cross {
+            // Collect to avoid borrow conflicts with the mutable worklist.
+            let targets: Vec<(K, Channel)> = cross_channel.dependents(key, channel).collect();
+            for (to_key, to_ch) in targets {
+                if !processed.contains(&(to_key, to_ch)) {
+                    worklist.push((to_key, to_ch));
+                }
+            }
+        }
+    }
 }
 
 impl<K> InvalidationTracker<K>
@@ -500,10 +792,27 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use crate::policy::{EagerPolicy, LazyPolicy};
+    use crate::policy::{EagerPolicy, LazyPolicy, PropagationPolicy};
 
     const LAYOUT: Channel = Channel::new(0);
     const PAINT: Channel = Channel::new(1);
+
+    struct OffGraphMarkPolicy {
+        extra_key: u32,
+    }
+
+    impl PropagationPolicy<u32> for OffGraphMarkPolicy {
+        fn propagate(
+            &self,
+            key: u32,
+            channel: Channel,
+            _graph: &InvalidationGraph<u32>,
+            invalidated: &mut InvalidationSet<u32>,
+        ) {
+            invalidated.mark(key, channel);
+            invalidated.mark(self.extra_key, channel);
+        }
+    }
 
     #[test]
     fn basic_workflow() {
@@ -673,5 +982,463 @@ mod tests {
         tracker.clear_all();
 
         assert!(tracker.is_clean());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cascade tests (Phase 2)
+    // -----------------------------------------------------------------------
+
+    const COMPOSITE: Channel = Channel::new(2);
+
+    #[test]
+    fn cascade_mark_propagates_to_cascaded_channels() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        tracker.mark(1, LAYOUT);
+
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
+    }
+
+    #[test]
+    fn cascade_mark_with_eager_propagates_across_channels() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(2, 1, PAINT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        // LAYOUT: 1 and 2 (eager propagation).
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(2, LAYOUT));
+        // PAINT: also 1 and 2 (cascade + eager propagation on PAINT).
+        assert!(tracker.is_invalidated(1, PAINT));
+        assert!(tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn cascade_mark_with_lazy() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+
+        // Lazy: only marks the key itself, but on both channels.
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
+        assert!(!tracker.is_invalidated(2, LAYOUT));
+        assert!(!tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn cascade_transitive_chain() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cascade(PAINT, COMPOSITE).unwrap();
+
+        tracker.mark(1, LAYOUT);
+
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
+        assert!(tracker.is_invalidated(1, COMPOSITE));
+    }
+
+    #[test]
+    fn no_cascade_zero_overhead() {
+        // Without cascades, mark should only affect the specified channel.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        tracker.mark(1, LAYOUT);
+
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(!tracker.is_invalidated(1, PAINT));
+    }
+
+    #[test]
+    fn cascade_add_remove() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        assert!(tracker.add_cascade(LAYOUT, PAINT).unwrap());
+        assert!(!tracker.add_cascade(LAYOUT, PAINT).unwrap()); // duplicate
+
+        assert!(tracker.remove_cascade(LAYOUT, PAINT));
+        assert!(!tracker.remove_cascade(LAYOUT, PAINT)); // already removed
+
+        // After removal, no cascade.
+        tracker.mark(1, LAYOUT);
+        assert!(!tracker.is_invalidated(1, PAINT));
+    }
+
+    #[test]
+    fn cascade_accessor() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        assert!(tracker.cascade().cascades_from(LAYOUT).contains(PAINT));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-channel edge tests (Phase 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cross_channel_mark_with_follows_edges() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        // Node 1's LAYOUT output feeds node 2's PAINT input.
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        // Node 1 on LAYOUT.
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        // Node 2 on PAINT (via cross-channel edge).
+        assert!(tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn cross_channel_with_same_channel_deps() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(3, 2, PAINT).unwrap();
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        // Cross-channel: 2 on PAINT, then same-channel: 3 on PAINT.
+        assert!(tracker.is_invalidated(2, PAINT));
+        assert!(tracker.is_invalidated(3, PAINT));
+    }
+
+    #[test]
+    fn cross_channel_with_cascade() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(1, PAINT, 2, COMPOSITE);
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        // LAYOUT -> PAINT cascade marks 1 on PAINT.
+        assert!(tracker.is_invalidated(1, PAINT));
+        // Cross-channel from (1, PAINT) -> (2, COMPOSITE).
+        assert!(tracker.is_invalidated(2, COMPOSITE));
+    }
+
+    #[test]
+    fn cross_channel_remove_edge() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        assert!(tracker.remove_cross_dependency(1, LAYOUT, 2, PAINT));
+        assert!(!tracker.remove_cross_dependency(1, LAYOUT, 2, PAINT));
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        assert!(!tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn cross_channel_remove_key_cleans_edges() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.mark(1, LAYOUT);
+
+        tracker.remove_key(1);
+
+        // Cross-channel edges are cleaned up.
+        assert!(
+            tracker
+                .cross_channel()
+                .dependents(1, LAYOUT)
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_channel_accessor() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        assert!(tracker.cross_channel().is_empty());
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        assert!(!tracker.cross_channel().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-channel drain tests (Phase 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_channels_sorted_basic() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        tracker.mark(5, PAINT);
+
+        let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+        assert_eq!(results, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
+    }
+
+    #[test]
+    fn drain_channels_sorted_empty_channels_skipped() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.mark(1, PAINT);
+
+        let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+        assert_eq!(results, vec![(PAINT, 1)]);
+    }
+
+    #[test]
+    fn drain_channels_sorted_respects_order() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.mark(1, LAYOUT);
+        tracker.mark(2, PAINT);
+
+        // PAINT first, then LAYOUT.
+        let results = tracker.drain_channels_sorted(&[PAINT, LAYOUT]);
+        assert_eq!(results, vec![(PAINT, 2), (LAYOUT, 1)]);
+    }
+
+    #[test]
+    fn drain_channels_sorted_clears_channels() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.mark(1, LAYOUT);
+        tracker.mark(2, PAINT);
+
+        let _ = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+
+        assert!(!tracker.has_invalidated(LAYOUT));
+        assert!(!tracker.has_invalidated(PAINT));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-channel transitive query tests (Phase 5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transitive_dependents_cross_same_channel_only() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 2, LAYOUT).unwrap();
+
+        let deps = tracker.transitive_dependents_cross(1, LAYOUT);
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&(2, LAYOUT)));
+        assert!(deps.contains(&(3, LAYOUT)));
+    }
+
+    #[test]
+    fn transitive_dependents_cross_with_cascade() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_dependency(2, 1, PAINT).unwrap();
+
+        let deps = tracker.transitive_dependents_cross(1, LAYOUT);
+        // Cascade: (1, LAYOUT) -> (1, PAINT).
+        // Same-channel on PAINT: (1, PAINT) -> (2, PAINT).
+        assert!(deps.contains(&(1, PAINT)));
+        assert!(deps.contains(&(2, PAINT)));
+    }
+
+    #[test]
+    fn transitive_dependents_cross_with_cross_edges() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_dependency(3, 2, PAINT).unwrap();
+
+        let deps = tracker.transitive_dependents_cross(1, LAYOUT);
+        // Cross-channel: (1, LAYOUT) -> (2, PAINT).
+        // Same-channel on PAINT: (2, PAINT) -> (3, PAINT).
+        assert!(deps.contains(&(2, PAINT)));
+        assert!(deps.contains(&(3, PAINT)));
+    }
+
+    #[test]
+    fn transitive_dependents_cross_combined() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        // Same-channel deps on LAYOUT.
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        // Cascade LAYOUT -> PAINT.
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        // Cross-channel: (2, LAYOUT) -> (3, COMPOSITE).
+        tracker.add_cross_dependency(2, LAYOUT, 3, COMPOSITE);
+
+        let deps = tracker.transitive_dependents_cross(1, LAYOUT);
+
+        // Same-channel: (2, LAYOUT).
+        assert!(deps.contains(&(2, LAYOUT)));
+        // Cascade: (1, PAINT), (2, PAINT) (from visiting 1 and 2 on LAYOUT).
+        assert!(deps.contains(&(1, PAINT)));
+        assert!(deps.contains(&(2, PAINT)));
+        // Cross-channel: (3, COMPOSITE).
+        assert!(deps.contains(&(3, COMPOSITE)));
+    }
+
+    #[test]
+    fn transitive_dependents_cross_no_duplicates() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        // Diamond: both cascade and cross-channel lead to (1, PAINT).
+        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
+
+        let deps = tracker.transitive_dependents_cross(1, LAYOUT);
+        // (1, PAINT) should appear exactly once.
+        let paint_count = deps
+            .iter()
+            .filter(|&&(k, ch)| k == 1 && ch == PAINT)
+            .count();
+        assert_eq!(paint_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Closure-depth tests: these probe multi-hop and chained semantics
+    // that the original one-hop tests missed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cross_channel_from_propagated_dependent_not_just_root() {
+        // Bug regression: cross-channel edges from eagerly-propagated
+        // (non-root) keys must fire, not just edges from the root.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        // 0 -> 1 on LAYOUT (1 depends on 0).
+        tracker.add_dependency(1, 0, LAYOUT).unwrap();
+        // Cross-channel edge from key 1 (not the root!).
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+
+        tracker.mark_with(0, LAYOUT, &EagerPolicy);
+
+        // Eager propagation marks 0 and 1 on LAYOUT.
+        assert!(tracker.is_invalidated(0, LAYOUT));
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        // The cross-channel edge from (1, LAYOUT) must fire.
+        assert!(
+            tracker.is_invalidated(2, PAINT),
+            "cross-channel edge from propagated dependent must fire"
+        );
+    }
+
+    #[test]
+    fn cascade_applies_to_all_propagated_dependents_not_just_root() {
+        // Bug regression: when eager propagation marks dependents, cascades
+        // must apply to ALL of them, not just the root key.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        // Both 1 and 2 are marked on LAYOUT (eager propagation).
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(2, LAYOUT));
+        // Cascade must apply to BOTH keys, not just root.
+        assert!(
+            tracker.is_invalidated(1, PAINT),
+            "cascade must apply to root"
+        );
+        assert!(
+            tracker.is_invalidated(2, PAINT),
+            "cascade must apply to propagated dependent"
+        );
+    }
+
+    #[test]
+    fn cascade_fires_from_cross_channel_target() {
+        // Cross-channel edge leads to (2, PAINT), and PAINT cascades to
+        // COMPOSITE. The cascade on the target channel must fire.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cascade(PAINT, COMPOSITE).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        assert!(tracker.is_invalidated(2, PAINT));
+        assert!(
+            tracker.is_invalidated(2, COMPOSITE),
+            "cascade on cross-channel target channel must fire"
+        );
+    }
+
+    #[test]
+    fn chained_cross_channel_edges() {
+        // (1, LAYOUT) -> (2, PAINT) -> (3, COMPOSITE)
+        // mark_with(1, LAYOUT) must realize the full chain.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(2, PAINT, 3, COMPOSITE);
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        assert!(tracker.is_invalidated(2, PAINT));
+        assert!(
+            tracker.is_invalidated(3, COMPOSITE),
+            "chained cross-channel edges must be followed transitively"
+        );
+    }
+
+    #[test]
+    fn mark_with_parity_with_transitive_dependents_cross() {
+        // The mark-time closure must match the query-time closure.
+        // Every (key, channel) returned by transitive_dependents_cross
+        // must be invalidated after mark_with with eager policy.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        // Build a complex graph.
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 2, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(2, LAYOUT, 4, COMPOSITE);
+        tracker.add_cross_dependency(4, COMPOSITE, 5, PAINT);
+        tracker.add_dependency(6, 5, PAINT).unwrap();
+
+        // Query the expected closure.
+        let expected = tracker.transitive_dependents_cross(1, LAYOUT);
+
+        // Mark and verify parity.
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        for (k, ch) in &expected {
+            assert!(
+                tracker.is_invalidated(*k, *ch),
+                "mark_with must realize ({k}, {ch:?}) from transitive_dependents_cross"
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_policy_does_not_cascade_or_cross_channel_dependents() {
+        // With lazy policy, only the root key is marked. Dependents are
+        // NOT marked, so cascades/cross-channel from dependents must NOT fire.
+        let mut tracker = InvalidationTracker::<u32>::new();
+
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(2, LAYOUT, 3, COMPOSITE);
+
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+
+        // Root key 1 is marked on LAYOUT and cascaded to PAINT.
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
+        // Key 2 is NOT marked (lazy doesn't propagate).
+        assert!(!tracker.is_invalidated(2, LAYOUT));
+        // Cross-channel from (2, LAYOUT) must NOT fire (2 not invalidated).
+        assert!(!tracker.is_invalidated(3, COMPOSITE));
+    }
+
+    #[test]
+    fn custom_policy_off_graph_marks_do_not_trigger_cross_channel_follow_up() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(9, LAYOUT, 10, PAINT);
+
+        let policy = OffGraphMarkPolicy { extra_key: 9 };
+        tracker.mark_with(1, LAYOUT, &policy);
+
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(9, LAYOUT));
+        assert!(
+            !tracker.is_invalidated(10, PAINT),
+            "cross-channel traversal is not defined for off-graph keys marked by a custom policy"
+        );
     }
 }

@@ -41,10 +41,10 @@ use crate::channel::Channel;
 /// ```
 #[derive(Debug, Clone)]
 pub struct CrossChannelEdges<K> {
-    /// Forward map: (from_key, from_channel) → list of (to_key, to_channel).
-    forward: HashMap<(K, u8), Vec<(K, u8)>>,
-    /// Reverse map: (to_key, to_channel) → list of (from_key, from_channel).
-    reverse: HashMap<(K, u8), Vec<(K, u8)>>,
+    /// Forward map: `(from_key, from_channel)` → list of `(to_key, to_channel)`.
+    forward: HashMap<(K, Channel), Vec<(K, Channel)>>,
+    /// Reverse map: `(to_key, to_channel)` → list of `(from_key, from_channel)`.
+    reverse: HashMap<(K, Channel), Vec<(K, Channel)>>,
 }
 
 impl<K> Default for CrossChannelEdges<K>
@@ -78,15 +78,9 @@ where
     /// Adds a cross-channel edge.
     ///
     /// Returns `true` if the edge was newly added, `false` if it already existed.
-    pub fn add_edge(
-        &mut self,
-        from_key: K,
-        from_ch: Channel,
-        to_key: K,
-        to_ch: Channel,
-    ) -> bool {
-        let from = (from_key, from_ch.index());
-        let to = (to_key, to_ch.index());
+    pub fn add_edge(&mut self, from_key: K, from_ch: Channel, to_key: K, to_ch: Channel) -> bool {
+        let from = (from_key, from_ch);
+        let to = (to_key, to_ch);
 
         let fwd = self.forward.entry(from).or_default();
         if fwd.contains(&to) {
@@ -108,8 +102,8 @@ where
         to_key: K,
         to_ch: Channel,
     ) -> bool {
-        let from = (from_key, from_ch.index());
-        let to = (to_key, to_ch.index());
+        let from = (from_key, from_ch);
+        let to = (to_key, to_ch);
 
         let removed = if let Some(fwd) = self.forward.get_mut(&from) {
             if let Some(pos) = fwd.iter().position(|e| *e == to) {
@@ -125,14 +119,13 @@ where
             false
         };
 
-        if removed {
-            if let Some(rev) = self.reverse.get_mut(&to) {
-                if let Some(pos) = rev.iter().position(|e| *e == from) {
-                    rev.swap_remove(pos);
-                    if rev.is_empty() {
-                        self.reverse.remove(&to);
-                    }
-                }
+        if removed
+            && let Some(rev) = self.reverse.get_mut(&to)
+            && let Some(pos) = rev.iter().position(|e| *e == from)
+        {
+            rev.swap_remove(pos);
+            if rev.is_empty() {
+                self.reverse.remove(&to);
             }
         }
 
@@ -145,10 +138,10 @@ where
     /// when `key` is invalidated on `channel`.
     pub fn dependents(&self, key: K, ch: Channel) -> impl Iterator<Item = (K, Channel)> + '_ {
         self.forward
-            .get(&(key, ch.index()))
+            .get(&(key, ch))
             .into_iter()
             .flat_map(|v| v.iter())
-            .map(|&(k, c)| (k, Channel::new(c)))
+            .copied()
     }
 
     /// Returns an iterator over the cross-channel dependencies of `(key, channel)`.
@@ -157,17 +150,17 @@ where
     /// cause `key` on `channel` to be invalidated.
     pub fn dependencies(&self, key: K, ch: Channel) -> impl Iterator<Item = (K, Channel)> + '_ {
         self.reverse
-            .get(&(key, ch.index()))
+            .get(&(key, ch))
             .into_iter()
             .flat_map(|v| v.iter())
-            .map(|&(k, c)| (k, Channel::new(c)))
+            .copied()
     }
 
     /// Removes all cross-channel edges involving `key` (on any channel).
     pub fn remove_key(&mut self, key: K) {
         // Collect all forward entries for this key on any channel, then remove
         // reverse entries.
-        let fwd_keys: Vec<(K, u8)> = self
+        let fwd_keys: Vec<(K, Channel)> = self
             .forward
             .keys()
             .filter(|(k, _)| *k == key)
@@ -191,7 +184,7 @@ where
 
         // Collect all reverse entries for this key on any channel, then remove
         // forward entries.
-        let rev_keys: Vec<(K, u8)> = self
+        let rev_keys: Vec<(K, Channel)> = self
             .reverse
             .keys()
             .filter(|(k, _)| *k == key)
