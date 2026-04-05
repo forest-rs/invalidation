@@ -8,10 +8,14 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published Invalidation release is [0.1.0](#010-2026-03-11) which was released on 2026-03-11.
-You can find its changes [documented below](#010-2026-03-11).
+The latest published Invalidation release is [0.1.1](#011-2026-04-05) which was released on 2026-04-05.
+You can find its changes [documented below](#011-2026-04-05).
 
 ## [Unreleased]
+
+No changes yet.
+
+## [0.1.1][] (2026-04-05)
 
 This release has an [MSRV][] of 1.88.
 
@@ -38,7 +42,8 @@ This is the initial release.
 
 [@waywardmonkeys]: https://github.com/waywardmonkeys
 
-[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/forest-rs/invalidation/releases/tag/v0.1.1
 [0.1.0]: https://github.com/forest-rs/invalidation/releases/tag/v0.1.0
 
 [MSRV]: README.md#minimum-supported-rust-version-msrv
