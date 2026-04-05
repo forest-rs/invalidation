@@ -155,7 +155,7 @@ assert_eq!(affected, vec![stylesheet, button]);
 ## Minimum Supported Rust Version (MSRV)
 
 This version of `invalidation` has been verified to compile with **Rust
-1.92** and later.
+1.88** and later.
 
 Future versions might increase the Rust version requirement. That is not
 treated as a breaking change and may happen in minor or patch releases.
