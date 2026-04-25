@@ -20,6 +20,8 @@ You can find its changes [documented below](#011-2026-04-05).
   `CrossChannelEdges::clear_dependents`,
   `CrossChannelEdges::clear_dependencies`, and the corresponding
   `InvalidationTracker` wrappers.
+- Added `ChannelCascade::from_edges` and
+  `InvalidationTracker::with_cascades` for static cascade setup.
 
 ### Removed
 

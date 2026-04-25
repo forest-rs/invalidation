@@ -134,6 +134,24 @@ impl ChannelCascade {
         }
     }
 
+    /// Creates a cascade from an edge list.
+    ///
+    /// Edges are applied in iteration order with the same semantics as
+    /// [`add_cascade`](Self::add_cascade): duplicate edges are ignored, and
+    /// self-cascades or cycles return [`CascadeCycleError`].
+    ///
+    /// If an edge would create a cycle, construction stops and returns the
+    /// error. The partially-built cascade is discarded.
+    pub fn from_edges(
+        edges: impl IntoIterator<Item = (Channel, Channel)>,
+    ) -> Result<Self, CascadeCycleError> {
+        let mut cascade = Self::new();
+        for (from, to) in edges {
+            cascade.add_cascade(from, to)?;
+        }
+        Ok(cascade)
+    }
+
     /// Adds a cascade rule: invalidation on `from` also marks `to`.
     ///
     /// Returns `Ok(true)` if the rule was newly added, `Ok(false)` if it
@@ -295,6 +313,24 @@ mod tests {
         let mut cascade = ChannelCascade::new();
         assert!(cascade.add_cascade(LAYOUT, PAINT).unwrap());
         assert!(!cascade.add_cascade(LAYOUT, PAINT).unwrap());
+    }
+
+    #[test]
+    fn from_edges_builds_static_cascade() {
+        let cascade =
+            ChannelCascade::from_edges([(LAYOUT, PAINT), (PAINT, COMPOSITE), (LAYOUT, PAINT)])
+                .unwrap();
+
+        let targets = cascade.cascades_from(LAYOUT);
+        assert!(targets.contains(PAINT));
+        assert!(targets.contains(COMPOSITE));
+    }
+
+    #[test]
+    fn from_edges_rejects_cycles() {
+        let err = ChannelCascade::from_edges([(LAYOUT, PAINT), (PAINT, LAYOUT)]).unwrap_err();
+        assert_eq!(err.from, PAINT);
+        assert_eq!(err.to, LAYOUT);
     }
 
     #[test]

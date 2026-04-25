@@ -156,6 +156,23 @@ where
         }
     }
 
+    /// Creates a tracker with static channel cascade rules.
+    ///
+    /// This is a convenience for systems with a fixed phase graph. Edges are
+    /// applied with [`ChannelCascade::from_edges`]; duplicate edges are ignored,
+    /// and cycles return [`CascadeCycleError`].
+    pub fn with_cascades(
+        cascades: impl IntoIterator<Item = (Channel, Channel)>,
+    ) -> Result<Self, CascadeCycleError> {
+        Ok(Self {
+            graph: InvalidationGraph::new(),
+            invalidated: InvalidationSet::new(),
+            cycle_handling: CycleHandling::default(),
+            cascade: ChannelCascade::from_edges(cascades)?,
+            cross_channel: CrossChannelEdges::new(),
+        })
+    }
+
     /// Creates a tracker from an existing dependency graph.
     ///
     /// This is useful when graph construction is owned by a separate setup
@@ -840,6 +857,19 @@ mod tests {
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
         let order: Vec<_> = tracker.drain_sorted(LAYOUT).collect();
         assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn can_seed_tracker_with_static_cascades() {
+        let mut tracker =
+            InvalidationTracker::<u32>::with_cascades([(LAYOUT, PAINT), (PAINT, COMPOSITE)])
+                .unwrap();
+
+        tracker.mark(1, LAYOUT);
+
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
+        assert!(tracker.is_invalidated(1, COMPOSITE));
     }
 
     #[test]
