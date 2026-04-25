@@ -348,75 +348,76 @@ where
         scratch: Option<&'t mut TraversalScratch<K>>,
         mut trace: Option<&'t mut dyn InvalidationTrace<K>>,
     ) -> Vec<K> {
-        let mut out = Vec::new();
-
         // Affected drains need a visited set that persists across roots.
         match scratch {
             Some(s) => {
                 s.reset();
-
-                for root in roots {
-                    if !Self::is_allowed(within, root, allowed) {
-                        continue;
-                    }
-                    let newly = s.visited.insert(root);
-                    if newly {
-                        out.push(root);
-                        s.stack.push(root);
-                    }
-                    if let Some(t) = trace.as_deref_mut() {
-                        t.root(root, channel, newly);
-                    }
-                }
-
-                while let Some(because) = s.stack.pop() {
-                    for dependent in graph.dependents(because, channel) {
-                        if !Self::is_allowed(within, dependent, allowed) {
-                            continue;
-                        }
-                        let newly = s.visited.insert(dependent);
-                        if let Some(t) = trace.as_deref_mut() {
-                            t.caused_by(dependent, because, channel, newly);
-                        }
-                        if newly {
-                            out.push(dependent);
-                            s.stack.push(dependent);
-                        }
-                    }
-                }
+                Self::collect_affected_with_state(
+                    graph,
+                    channel,
+                    roots,
+                    within,
+                    allowed,
+                    &mut s.stack,
+                    &mut s.visited,
+                    &mut trace,
+                )
             }
             None => {
                 let mut visited: HashSet<K> = HashSet::new();
                 let mut stack: Vec<K> = Vec::new();
+                Self::collect_affected_with_state(
+                    graph,
+                    channel,
+                    roots,
+                    within,
+                    allowed,
+                    &mut stack,
+                    &mut visited,
+                    &mut trace,
+                )
+            }
+        }
+    }
 
-                for root in roots {
-                    if !Self::is_allowed(within, root, allowed) {
-                        continue;
-                    }
-                    let newly = visited.insert(root);
-                    if newly {
-                        out.push(root);
-                        stack.push(root);
-                    }
-                    if let Some(t) = trace.as_deref_mut() {
-                        t.root(root, channel, newly);
-                    }
+    fn collect_affected_with_state(
+        graph: &InvalidationGraph<K>,
+        channel: Channel,
+        roots: Vec<K>,
+        within: &Within<'d, K>,
+        allowed: Option<&HashSet<K>>,
+        stack: &mut Vec<K>,
+        visited: &mut HashSet<K>,
+        trace: &mut Option<&mut dyn InvalidationTrace<K>>,
+    ) -> Vec<K> {
+        let mut out = Vec::new();
+
+        for root in roots {
+            if !Self::is_allowed(within, root, allowed) {
+                continue;
+            }
+            let newly = visited.insert(root);
+            if newly {
+                out.push(root);
+                stack.push(root);
+            }
+            if let Some(t) = trace.as_deref_mut() {
+                t.root(root, channel, newly);
+            }
+        }
+
+        while let Some(because) = stack.pop() {
+            for dependent in graph.dependents(because, channel) {
+                if !Self::is_allowed(within, dependent, allowed) {
+                    continue;
                 }
-
-                while let Some(because) = stack.pop() {
-                    for dependent in graph.dependents(because, channel) {
-                        if !Self::is_allowed(within, dependent, allowed) {
-                            continue;
-                        }
-                        let newly = visited.insert(dependent);
-                        if let Some(t) = trace.as_deref_mut() {
-                            t.caused_by(dependent, because, channel, newly);
-                        }
-                        if newly {
-                            out.push(dependent);
-                            stack.push(dependent);
-                        }
-                    }
+                let newly = visited.insert(dependent);
+                if let Some(t) = trace.as_deref_mut() {
+                    t.caused_by(dependent, because, channel, newly);
+                }
+                if newly {
+                    out.push(dependent);
+                    stack.push(dependent);
                 }
             }
         }
