@@ -448,35 +448,15 @@ where
             // 1. Run the propagation policy on this (key, channel).
             policy.propagate(k, ch, &self.graph, &mut self.invalidated);
 
-            // 2. Discover cascade/cross-channel targets from k and all of
-            //    its transitive dependents that were actually marked.
-            let ch_cascaded = self.cascade.cascades_from(ch);
-            let has_cross = !self.cross_channel.is_empty();
-
-            // Enqueue cascade + cross-channel targets for k itself.
-            Self::enqueue_cross_targets(
-                k,
-                ch,
-                ch_cascaded,
-                has_cross,
-                &self.cross_channel,
-                &processed,
-                &mut worklist,
-            );
+            // 2. Discover cross-channel targets from k and all of its
+            //    transitive dependents that were actually marked.
+            self.enqueue_cross_successors(k, ch, &processed, &mut worklist);
 
             // Enqueue targets for each transitive dependent of k on ch
             // that was actually marked (eager marks them, lazy does not).
             for dep in self.graph.transitive_dependents(k, ch) {
                 if self.invalidated.is_invalidated(dep, ch) {
-                    Self::enqueue_cross_targets(
-                        dep,
-                        ch,
-                        ch_cascaded,
-                        has_cross,
-                        &self.cross_channel,
-                        &processed,
-                        &mut worklist,
-                    );
+                    self.enqueue_cross_successors(dep, ch, &processed, &mut worklist);
                 }
             }
         }
@@ -706,55 +686,43 @@ where
                 }
             }
 
-            // 2. Cascade channels (same key, different channels).
-            let cascaded = self.cascade.cascades_from(ch);
-            for cascade_ch in cascaded {
-                if visited.insert((k, cascade_ch)) {
-                    result.push((k, cascade_ch));
-                    queue.push((k, cascade_ch));
+            // 2. Cascade and cross-channel successors.
+            self.for_each_cross_successor(k, ch, |next_key, next_ch| {
+                if visited.insert((next_key, next_ch)) {
+                    result.push((next_key, next_ch));
+                    queue.push((next_key, next_ch));
                 }
-            }
-
-            // 3. Cross-channel edges.
-            for (dep_key, dep_ch) in self.cross_channel.dependents(k, ch) {
-                if visited.insert((dep_key, dep_ch)) {
-                    result.push((dep_key, dep_ch));
-                    queue.push((dep_key, dep_ch));
-                }
-            }
+            });
         }
 
         result
     }
 
-    /// Enqueues cascade and cross-channel targets for a single key into the
-    /// worklist, skipping already-processed pairs.
-    fn enqueue_cross_targets(
+    /// Calls `f` for each cascade or cross-channel successor of `(key, channel)`.
+    fn for_each_cross_successor(&self, key: K, channel: Channel, mut f: impl FnMut(K, Channel)) {
+        for cascade_ch in self.cascade.cascades_from(channel) {
+            f(key, cascade_ch);
+        }
+
+        for (to_key, to_ch) in self.cross_channel.dependents(key, channel) {
+            f(to_key, to_ch);
+        }
+    }
+
+    /// Enqueues cascade and cross-channel successors for `mark_with`, skipping
+    /// pairs that have already run the propagation policy.
+    fn enqueue_cross_successors(
+        &self,
         key: K,
         channel: Channel,
-        ch_cascaded: crate::channel::ChannelSet,
-        has_cross: bool,
-        cross_channel: &CrossChannelEdges<K>,
         processed: &hashbrown::HashSet<(K, Channel)>,
         worklist: &mut Vec<(K, Channel)>,
     ) {
-        // Cascade targets: same key, cascaded channels.
-        for cascade_ch in ch_cascaded {
-            if !processed.contains(&(key, cascade_ch)) {
-                worklist.push((key, cascade_ch));
+        self.for_each_cross_successor(key, channel, |to_key, to_ch| {
+            if !processed.contains(&(to_key, to_ch)) {
+                worklist.push((to_key, to_ch));
             }
-        }
-
-        // Cross-channel edge targets.
-        if has_cross {
-            // Collect to avoid borrow conflicts with the mutable worklist.
-            let targets: Vec<(K, Channel)> = cross_channel.dependents(key, channel).collect();
-            for (to_key, to_ch) in targets {
-                if !processed.contains(&(to_key, to_ch)) {
-                    worklist.push((to_key, to_ch));
-                }
-            }
-        }
+        });
     }
 }
 
