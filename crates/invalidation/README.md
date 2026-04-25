@@ -13,7 +13,7 @@ The crate is centered on a small set of building blocks:
 - `InvalidationGraph` for dependency edges and cycle handling
 - `InvalidationSet` for accumulated invalidated keys
 - `EagerPolicy` and `LazyPolicy` for propagation strategy
-- `InvalidationTracker` for the combined convenience API
+- `InvalidationTracker` for coordinated graph, set, cascade, and cross-channel workflows
 - `DrainBuilder` and deterministic drain helpers for ordered processing
 
 It intentionally does not own recomputation, caching, or scheduling. Those
@@ -47,10 +47,10 @@ assert_eq!(ordered, vec![1, 2, 3]);
 
 ## Choosing The Main API
 
-- Use `InvalidationTracker` for the most direct “just give me the pieces
-  together” workflow.
+- Use `InvalidationTracker` when one coordinator should own dependency edges,
+  invalidation state, channel cascades, and cross-channel edges.
 - Use `InvalidationGraph` plus `InvalidationSet` separately if your embedder
-  already owns state and only wants the primitives.
+  already owns propagation or scheduling policy and only wants the primitives.
 - Use `DrainBuilder` when you need deterministic ordering, targeted drains,
   scratch reuse, or tracing.
 - Use `intern::Interner` when your natural keys are strings or other non-`Copy`

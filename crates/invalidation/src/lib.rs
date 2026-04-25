@@ -58,9 +58,11 @@
 //!
 //! ## Choosing An API
 //!
-//! - Use [`InvalidationTracker`] for the common “graph + set together” workflow.
+//! - Use [`InvalidationTracker`] when one coordinator should own dependency
+//!   edges, invalidation state, channel cascades, and cross-channel edges.
 //! - Use [`InvalidationGraph`] plus [`InvalidationSet`] separately if your
-//!   embedder already owns invalidation state and just wants the primitives.
+//!   embedder already owns propagation or scheduling policy and just wants the
+//!   primitives.
 //! - Use [`DrainBuilder`] when you need deterministic drains, targeted drains,
 //!   scratch reuse, or tracing.
 //! - Use [`intern::Interner`] when your natural keys are not already compact
@@ -68,8 +70,8 @@
 //!
 //! ## Using Components Separately
 //!
-//! While [`InvalidationTracker`] provides a convenient combined API, you can also
-//! use the underlying types directly for more control:
+//! While [`InvalidationTracker`] coordinates the common workflow, you can also
+//! use the lower-level types directly for more control:
 //!
 //! ```rust
 //! use invalidation::{

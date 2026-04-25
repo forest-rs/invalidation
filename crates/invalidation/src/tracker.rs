@@ -1,7 +1,7 @@
 // Copyright 2025 the Invalidation Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Combined invalidation tracker: graph + set convenience type.
+//! Invalidation coordinator for graph, set, cascades, and cross-channel edges.
 
 use alloc::vec::Vec;
 use core::hash::Hash;
@@ -17,11 +17,15 @@ use crate::scratch::TraversalScratch;
 use crate::set::InvalidationSet;
 use crate::trace::InvalidationTrace;
 
-/// Combined invalidation tracker with dependency graph and invalidation set.
+/// Coordinates graph dependencies, invalidation state, and cross-channel rules.
 ///
-/// `InvalidationTracker` is a convenience type that bundles a [`InvalidationGraph`] and
-/// [`InvalidationSet`] together, providing a unified API for common invalidation
-/// operations.
+/// `InvalidationTracker` owns the common orchestration layer for invalidation:
+/// a same-channel [`InvalidationGraph`], an [`InvalidationSet`], optional
+/// [`ChannelCascade`] rules, and optional [`CrossChannelEdges`]. Use it when
+/// marks should flow through those pieces as one coordinated operation.
+///
+/// If your embedder already owns propagation or scheduling policy, use
+/// [`InvalidationGraph`] and [`InvalidationSet`] directly instead.
 ///
 /// # Type Parameters
 ///
@@ -55,7 +59,8 @@ use crate::trace::InvalidationTrace;
 ///
 /// # See Also
 ///
-/// - [`InvalidationGraph`] and [`InvalidationSet`]: The underlying components.
+/// - [`InvalidationGraph`] and [`InvalidationSet`]: Lower-level primitives.
+/// - [`ChannelCascade`] and [`CrossChannelEdges`]: Cross-channel coordination.
 /// - [`EagerPolicy`](crate::EagerPolicy) and [`LazyPolicy`](crate::LazyPolicy): Built-in propagation strategies.
 /// - [`drain_sorted`](crate::drain_sorted) and [`drain_affected_sorted`](crate::drain_affected_sorted): Free-function drain helpers.
 #[derive(Debug, Clone)]

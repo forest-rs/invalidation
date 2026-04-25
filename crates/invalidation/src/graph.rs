@@ -112,7 +112,8 @@ pub enum CycleHandling {
 ///
 /// # See Also
 ///
-/// - [`InvalidationTracker`](crate::InvalidationTracker): Convenience wrapper combining graph + set.
+/// - [`InvalidationTracker`](crate::InvalidationTracker): Coordinator for graph,
+///   set, cascade, and cross-channel workflows.
 /// - [`CycleHandling`]: Cycle policy used by [`add_dependency`](Self::add_dependency).
 /// - [`DrainSorted`](crate::DrainSorted): Drains invalidated keys in dependency order.
 #[derive(Debug, Clone)]

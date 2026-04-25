@@ -53,8 +53,8 @@ const MAX_CHANNELS: usize = 64;
 ///
 /// # See Also
 ///
-/// - [`InvalidationTracker`](crate::InvalidationTracker): Convenience wrapper combining a [`InvalidationGraph`](crate::InvalidationGraph)
-///   and `InvalidationSet`.
+/// - [`InvalidationTracker`](crate::InvalidationTracker): Coordinator for graph,
+///   set, cascade, and cross-channel workflows.
 /// - [`drain_sorted`](crate::drain_sorted): Drain a [`InvalidationSet`] in topological order given a graph.
 /// - [`drain_affected_sorted`](crate::drain_affected_sorted): Drain affected keys (roots + dependents), useful with [`LazyPolicy`](crate::LazyPolicy).
 #[derive(Debug)]

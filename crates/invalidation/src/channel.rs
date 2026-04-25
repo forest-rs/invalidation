@@ -29,7 +29,8 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 /// - [`ChannelSet`]: A compact set of channels.
 /// - [`InvalidationSet`](crate::InvalidationSet): Tracks invalidated keys per channel.
 /// - [`InvalidationGraph`](crate::InvalidationGraph): Stores dependencies per channel.
-/// - [`InvalidationTracker`](crate::InvalidationTracker): Convenience wrapper combining graph + set.
+/// - [`InvalidationTracker`](crate::InvalidationTracker): Coordinator for graph,
+///   set, cascade, and cross-channel workflows.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Channel(u8);
 
