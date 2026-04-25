@@ -91,7 +91,7 @@ When ties must be stable, or you only want to process part of the invalidated
 region, use `DrainBuilder`:
 
 ```rust
-use invalidation::{Channel, CycleHandling, InvalidationTracker};
+use invalidation::{Channel, InvalidationTracker};
 
 const LAYOUT: Channel = Channel::new(0);
 
@@ -111,6 +111,7 @@ let focused: Vec<_> = tracker
     .drain(LAYOUT)
     .within_dependencies_of(4)
     .deterministic()
+    .run()
     .collect();
 
 assert_eq!(focused, vec![1, 2, 4]);

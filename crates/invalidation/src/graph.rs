@@ -54,8 +54,12 @@ impl<K: fmt::Debug> core::error::Error for CycleError<K> {}
 pub enum CycleHandling {
     /// Panic in debug builds, silently ignore in release builds.
     ///
-    /// This is the default behavior: catches bugs during development with
-    /// zero cost in release builds.
+    /// This is the default behavior: catches bugs during development and
+    /// returns `Ok(false)` in release builds if a cycle is detected.
+    ///
+    /// This still performs the reachability check. Use [`Allow`](Self::Allow)
+    /// only when the caller guarantees acyclic input or intentionally permits
+    /// cycles.
     #[default]
     DebugAssert,
     /// Return an error if a cycle would be created.
