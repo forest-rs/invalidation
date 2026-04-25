@@ -19,6 +19,10 @@ You can find its changes [documented below](#011-2026-04-05).
   `InvalidationTracker::from_graph` or
   `InvalidationTracker::from_graph_with_cycle_handling` to seed a tracker from
   an existing graph while keeping later graph mutations behind the tracker API.
+- Removed `InvalidationTracker::invalidated_mut`. Use the tracker's `mark`,
+  `mark_with`, `clear`, `clear_all`, and drain methods for coordinated
+  invalidation state changes, or use a standalone `InvalidationSet` with the
+  free drain helpers when bypassing tracker orchestration is intentional.
 
 ## [0.1.1][] (2026-04-05)
 

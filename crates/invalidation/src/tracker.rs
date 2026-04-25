@@ -200,13 +200,6 @@ where
         &self.invalidated
     }
 
-    /// Returns a mutable reference to the underlying invalidation set.
-    #[inline]
-    #[must_use]
-    pub fn invalidated_mut(&mut self) -> &mut InvalidationSet<K> {
-        &mut self.invalidated
-    }
-
     /// Returns the current operation generation of the invalidation set.
     ///
     /// See [`InvalidationSet::generation`] for details.
