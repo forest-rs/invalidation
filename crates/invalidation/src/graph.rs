@@ -656,11 +656,11 @@ where
     /// The iteration order is not specified and may vary across runs or platforms.
     pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
         let mut seen = HashSet::new();
-        let max_len = self.forward_channels.len().max(self.reverse_channels.len());
-        // Iterate both channel vecs looking for non-empty entries.
-        // We need to reconstruct keys from indices — but DenseKey only provides
-        // index(), not from_index(). Instead, walk all adjacency lists.
         let mut all_keys: Vec<K> = Vec::new();
+
+        // `DenseKey` can map keys to indices, but cannot reconstruct keys from
+        // indices. Every graph key appears in at least one opposite adjacency
+        // list, so walking all stored edges is enough to recover the set.
         for ch in 0..MAX_CHANNELS {
             for inner in &self.forward[ch] {
                 for &k in inner {
@@ -677,28 +677,8 @@ where
                 }
             }
         }
-        // Also include keys that appear as "from" or "to" — they are in the
-        // adjacency lists of their counterparts, so the above already covers them.
-        // But keys with forward entries need to include themselves too.
-        // Actually, keys only appear in adjacency lists of other keys, not
-        // themselves. A key with forward edges appears as "from" — we need to
-        // find it. The forward_channels/reverse_channels vecs tell us which
-        // indices have entries, but we can't reconstruct K from an index.
-        //
-        // However, we can collect all K values that appear anywhere in the
-        // adjacency lists. A key with only forward edges (from) appears in
-        // the reverse list of its dependencies, and vice versa. So iterating
-        // all adjacency entries covers all keys.
-        let _ = max_len;
-        all_keys.into_iter()
-    }
 
-    /// Collects [`keys`](Self::keys) into a `Vec`.
-    ///
-    /// The order is not specified and may vary across runs or platforms.
-    #[must_use]
-    pub fn keys_vec(&self) -> Vec<K> {
-        self.keys().collect()
+        all_keys.into_iter()
     }
 }
 
@@ -1079,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_and_keys_vec_are_unique() {
+    fn keys_are_unique() {
         let mut graph = InvalidationGraph::<u32>::new();
         graph
             .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
@@ -1089,11 +1069,6 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&1));
         assert!(keys.contains(&2));
-
-        let keys_vec = graph.keys_vec();
-        assert_eq!(keys_vec.len(), 2);
-        assert!(keys_vec.contains(&1));
-        assert!(keys_vec.contains(&2));
     }
 
     #[test]
