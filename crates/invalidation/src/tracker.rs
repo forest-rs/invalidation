@@ -202,7 +202,7 @@ where
         &mut self.invalidated
     }
 
-    /// Returns the current generation of the invalidation set.
+    /// Returns the current operation generation of the invalidation set.
     ///
     /// See [`InvalidationSet::generation`] for details.
     #[inline]

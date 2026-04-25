@@ -13,7 +13,7 @@
 //!   with cycle detection and bidirectional traversal.
 //! - **Invalidation sets** ([`InvalidationSet`]): Accumulated invalidated keys
 //!   per channel with
-//!   generation tracking for stale-computation detection.
+//!   operation generation tracking for stale-observation detection.
 //! - **Propagation policies** ([`PropagationPolicy`], [`EagerPolicy`], [`LazyPolicy`]):
 //!   Pluggable strategies for how invalidation spreads through the graph.
 //! - **Topological drain** ([`DrainSorted`]): Kahn's algorithm to yield invalidated

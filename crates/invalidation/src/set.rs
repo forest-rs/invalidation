@@ -12,11 +12,13 @@ use crate::channel::Channel;
 /// Maximum number of channels supported (64).
 const MAX_CHANNELS: usize = 64;
 
-/// Accumulated invalidated keys per channel with generation tracking.
+/// Accumulated invalidated keys per channel with operation generation tracking.
 ///
 /// `InvalidationSet` maintains a set of invalidated keys for each channel, along with a
-/// generation counter that increments on every mutation. The generation can
-/// be used to detect stale computations or cache invalidation.
+/// generation counter that advances on invalidation-state operations. The
+/// generation can be used for coarse stale-observation checks, but it is not a
+/// content hash: some operations advance it even when the set's contents do not
+/// change.
 ///
 /// # Type Parameters
 ///
@@ -62,7 +64,7 @@ where
 {
     /// Per-channel invalidated key sets.
     channels: [HashSet<K>; MAX_CHANNELS],
-    /// Generation counter, incremented on each mutation.
+    /// Operation generation counter.
     generation: u64,
 }
 
@@ -88,11 +90,16 @@ where
         }
     }
 
-    /// Returns the current generation.
+    /// Returns the current operation generation.
     ///
-    /// The generation is incremented on every mutation (mark, clear, drain).
-    /// This can be used to detect whether the invalidation set has changed since a
-    /// previous observation.
+    /// The generation advances on invalidation-state operations such as
+    /// [`mark`](Self::mark), [`drain`](Self::drain), [`clear`](Self::clear), and
+    /// [`clear_all`](Self::clear_all). It is intentionally coarse: marking an
+    /// already-invalidated key or clearing an empty channel may still advance the
+    /// generation.
+    ///
+    /// Use this to detect that invalidation state was touched since a previous
+    /// observation, not to prove that the set contents changed.
     #[inline]
     #[must_use]
     pub fn generation(&self) -> u64 {
