@@ -57,6 +57,8 @@ Runnable examples:
 ## Gotchas
 
 - Edge direction matters: `add_dependency(a, b, ...)` means `a` depends on `b`.
+- `mark` is a direct mark plus same-key cascades; use `mark_with` for graph
+  propagation and cross-channel edges.
 - `LazyPolicy` should usually be paired with affected drains, not
   `drain_sorted`.
 - Dense deterministic drains assume a compact key space.

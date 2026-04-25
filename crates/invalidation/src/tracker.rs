@@ -400,10 +400,16 @@ where
         &self.cross_channel
     }
 
-    /// Marks a key as invalidated without propagation.
+    /// Marks a key as invalidated without graph or cross-channel propagation.
     ///
-    /// When cascade rules are configured, also marks the key on all
-    /// transitively cascaded channels.
+    /// This is a direct state update: it marks `(key, channel)` and, when
+    /// channel cascade rules are configured, the same key on all transitively
+    /// cascaded channels. It does not traverse same-channel graph dependents
+    /// and does not follow [`CrossChannelEdges`].
+    ///
+    /// For normal "this key changed; mark the full invalidation closure"
+    /// workflows, prefer [`mark_with`](Self::mark_with) with
+    /// [`EagerPolicy`](crate::EagerPolicy) or [`LazyPolicy`](crate::LazyPolicy).
     ///
     /// Returns `true` if the key was newly marked invalidated on the
     /// primary channel (cascade marks are not reflected in the return value).
@@ -419,7 +425,7 @@ where
         result
     }
 
-    /// Marks a key as invalidated using the given propagation policy.
+    /// Marks a key as invalidated and follows the full propagation closure.
     ///
     /// The policy determines how invalidation spreads through the dependency
     /// graph. See [`PropagationPolicy`] for details.

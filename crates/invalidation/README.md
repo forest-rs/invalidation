@@ -85,6 +85,16 @@ let ordered: Vec<_> = lazy.drain_affected_sorted(LAYOUT).collect();
 assert_eq!(ordered, vec![1, 2, 3]);
 ```
 
+## Marking Work
+
+Use `mark_with` for normal update workflows. It applies the chosen propagation
+policy, same-key channel cascades, and cross-channel edges until the
+invalidation closure is complete.
+
+Use `mark` only when you intentionally want a direct mark without same-channel
+graph traversal or cross-channel edge traversal. It still applies same-key
+channel cascades.
+
 ## Cascades And Cross-Channel Edges
 
 Use the tracker for the common case. `ChannelCascade` and `CrossChannelEdges`
@@ -176,6 +186,8 @@ assert_eq!(affected, vec![stylesheet, button]);
 ## Gotchas
 
 - `add_dependency(a, b, ...)` means `a` depends on `b`, not the reverse.
+- `mark` does not follow graph dependents or cross-channel edges; use
+  `mark_with` for the usual full-closure update path.
 - `LazyPolicy` and `drain_sorted` are usually the wrong pair.
 - Deterministic dense drains assume a compact key space; use `Interner` when
   keys are sparse or structured.

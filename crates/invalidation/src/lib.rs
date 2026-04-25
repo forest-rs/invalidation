@@ -78,6 +78,15 @@
 //! - Use [`intern::Interner`] when your natural keys are not already compact
 //!   `Copy` identifiers.
 //!
+//! ## Marking Work
+//!
+//! - Use [`InvalidationTracker::mark_with`] for normal update workflows. It
+//!   applies the chosen [`PropagationPolicy`], channel cascades, and
+//!   cross-channel edges until the invalidation closure is complete.
+//! - Use [`InvalidationTracker::mark`] only when you intentionally want a
+//!   direct mark without same-channel graph traversal or cross-channel edge
+//!   traversal. It still applies same-key channel cascades.
+//!
 //! ## Using Components Separately
 //!
 //! While [`InvalidationTracker`] coordinates the common workflow, you can also
@@ -148,6 +157,9 @@
 //! ## Common Mistakes
 //!
 //! - `add_dependency(a, b, ...)` means `a` depends on `b`.
+//! - [`InvalidationTracker::mark`] does not follow graph dependents or
+//!   cross-channel edges; [`InvalidationTracker::mark_with`] is the usual
+//!   full-closure marking API.
 //! - [`LazyPolicy`] is usually paired with affected drains, not plain
 //!   [`drain_sorted`].
 //! - Deterministic dense drains assume a compact key space; intern sparse or
