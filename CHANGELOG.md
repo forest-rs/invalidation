@@ -8,10 +8,14 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published Invalidation release is [0.1.1](#011-2026-04-05) which was released on 2026-04-05.
-You can find its changes [documented below](#011-2026-04-05).
+The latest published Invalidation release is [0.2.0](#020-2026-04-25) which was released on 2026-04-25.
+You can find its changes [documented below](#020-2026-04-25).
 
 ## [Unreleased]
+
+## [0.2.0][] (2026-04-25)
+
+This release has an [MSRV][] of 1.88.
 
 ### Added
 
@@ -22,6 +26,15 @@ You can find its changes [documented below](#011-2026-04-05).
   `InvalidationTracker` wrappers.
 - Added `ChannelCascade::from_edges` and
   `InvalidationTracker::with_cascades` for static cascade setup.
+- Added runnable examples for cascade/cross-channel workflows and retained
+  node-scoped multi-phase invalidation.
+
+### Changed
+
+- Updated docs to position `InvalidationTracker` as the common entry point and
+  clarify tracker orchestration, invalidation generation semantics, channel
+  edge usage, and `mark` versus `mark_with`.
+- Updated `hashbrown` to 0.17.
 
 ### Removed
 
@@ -66,7 +79,8 @@ This is the initial release.
 
 [@waywardmonkeys]: https://github.com/waywardmonkeys
 
-[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/forest-rs/invalidation/releases/tag/v0.2.0
 [0.1.1]: https://github.com/forest-rs/invalidation/releases/tag/v0.1.1
 [0.1.0]: https://github.com/forest-rs/invalidation/releases/tag/v0.1.0
 
