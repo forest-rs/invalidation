@@ -150,18 +150,42 @@ where
             cross_channel: CrossChannelEdges::new(),
         }
     }
+
+    /// Creates a tracker from an existing dependency graph.
+    ///
+    /// This is useful when graph construction is owned by a separate setup
+    /// phase, but invalidation state should still be managed by the tracker.
+    ///
+    /// The tracker uses the default cycle handling mode for future dependency
+    /// mutations. The supplied graph is not revalidated.
+    #[must_use]
+    pub fn from_graph(graph: InvalidationGraph<K>) -> Self {
+        Self::from_graph_with_cycle_handling(graph, CycleHandling::default())
+    }
+
+    /// Creates a tracker from an existing dependency graph and cycle policy.
+    ///
+    /// The `cycle_handling` value is used for future calls that mutate
+    /// dependencies through the tracker. The supplied graph is not revalidated.
+    #[must_use]
+    pub fn from_graph_with_cycle_handling(
+        graph: InvalidationGraph<K>,
+        cycle_handling: CycleHandling,
+    ) -> Self {
+        Self {
+            graph,
+            invalidated: InvalidationSet::new(),
+            cycle_handling,
+            cascade: ChannelCascade::new(),
+            cross_channel: CrossChannelEdges::new(),
+        }
+    }
+
     /// Returns a reference to the underlying dependency graph.
     #[inline]
     #[must_use]
     pub fn graph(&self) -> &InvalidationGraph<K> {
         &self.graph
-    }
-
-    /// Returns a mutable reference to the underlying dependency graph.
-    #[inline]
-    #[must_use]
-    pub fn graph_mut(&mut self) -> &mut InvalidationGraph<K> {
-        &mut self.graph
     }
 
     /// Returns a reference to the underlying invalidation set.
@@ -835,6 +859,24 @@ mod tests {
 
         // Channel is now clean
         assert!(!tracker.has_invalidated(LAYOUT));
+    }
+
+    #[test]
+    fn can_seed_tracker_from_graph() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+
+        let mut tracker =
+            InvalidationTracker::from_graph_with_cycle_handling(graph, CycleHandling::Error);
+
+        assert_eq!(tracker.cycle_handling(), CycleHandling::Error);
+        assert!(tracker.graph().dependents(1, LAYOUT).any(|key| key == 2));
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        let order: Vec<_> = tracker.drain_sorted(LAYOUT).collect();
+        assert_eq!(order, vec![1, 2]);
     }
 
     #[test]

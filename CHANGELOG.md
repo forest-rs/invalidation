@@ -13,7 +13,12 @@ You can find its changes [documented below](#011-2026-04-05).
 
 ## [Unreleased]
 
-No changes yet.
+### Removed
+
+- Removed `InvalidationTracker::graph_mut`. Use
+  `InvalidationTracker::from_graph` or
+  `InvalidationTracker::from_graph_with_cycle_handling` to seed a tracker from
+  an existing graph while keeping later graph mutations behind the tracker API.
 
 ## [0.1.1][] (2026-04-05)
 

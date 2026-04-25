@@ -61,9 +61,7 @@ fn build_dag_graph(n: u32, edges_per_node: u32, seed: u64) -> InvalidationGraph<
 
 fn build_dag_tracker(n: u32, edges_per_node: u32, seed: u64) -> InvalidationTracker<u32> {
     let graph = build_dag_graph(n, edges_per_node, seed);
-    let mut tracker = InvalidationTracker::new();
-    *tracker.graph_mut() = graph;
-    tracker
+    InvalidationTracker::from_graph(graph)
 }
 
 fn roots_repeating(unique_roots: u32, marks: u32) -> impl Iterator<Item = u32> {
