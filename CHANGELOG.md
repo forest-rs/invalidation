@@ -13,6 +13,14 @@ You can find its changes [documented below](#011-2026-04-05).
 
 ## [Unreleased]
 
+### Added
+
+- Added bulk cross-channel edge mutation APIs:
+  `CrossChannelEdges::replace_dependents`,
+  `CrossChannelEdges::clear_dependents`,
+  `CrossChannelEdges::clear_dependencies`, and the corresponding
+  `InvalidationTracker` wrappers.
+
 ### Removed
 
 - Removed `InvalidationTracker::graph_mut`. Use

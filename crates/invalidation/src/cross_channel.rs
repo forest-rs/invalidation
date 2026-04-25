@@ -116,6 +116,49 @@ where
         true
     }
 
+    /// Replaces all cross-channel dependents of `(from_key, from_ch)`.
+    ///
+    /// This is a batch convenience for the common "set all outgoing
+    /// cross-channel edges" workflow.
+    ///
+    /// - Dependents present in the old set but missing from `targets` are removed.
+    /// - Dependents present in `targets` but missing from the old set are added.
+    /// - Dependents present in both sets are left unchanged.
+    /// - Duplicate `(key, channel)` pairs in `targets` are ignored.
+    ///
+    /// # Returns
+    ///
+    /// - `true` if the dependent set changed.
+    /// - `false` if the dependent set was already equal to `targets`.
+    pub fn replace_dependents(
+        &mut self,
+        from_key: K,
+        from_ch: Channel,
+        targets: impl IntoIterator<Item = (K, Channel)>,
+    ) -> bool {
+        let mut new_set: Vec<(K, Channel)> = Vec::new();
+        for target in targets {
+            if !new_set.contains(&target) {
+                new_set.push(target);
+            }
+        }
+
+        let from = (from_key, from_ch);
+        let old: &[(K, Channel)] = self.forward.get(&from).map_or(&[], Vec::as_slice);
+        let unchanged =
+            old.len() == new_set.len() && old.iter().all(|target| new_set.contains(target));
+        if unchanged {
+            return false;
+        }
+
+        self.clear_dependents(from_key, from_ch);
+        for (to_key, to_ch) in new_set {
+            self.add_edge(from_key, from_ch, to_key, to_ch);
+        }
+
+        true
+    }
+
     /// Removes a cross-channel edge.
     ///
     /// Returns `true` if the edge existed and was removed.
@@ -154,6 +197,52 @@ where
         }
 
         removed
+    }
+
+    /// Removes all cross-channel dependents of `(from_key, from_ch)`.
+    ///
+    /// Returns `true` if any edges existed and were removed.
+    pub fn clear_dependents(&mut self, from_key: K, from_ch: Channel) -> bool {
+        let from = (from_key, from_ch);
+        let Some(targets) = self.forward.remove(&from) else {
+            return false;
+        };
+
+        for to in targets {
+            if let Some(rev) = self.reverse.get_mut(&to) {
+                if let Some(pos) = rev.iter().position(|e| *e == from) {
+                    rev.swap_remove(pos);
+                }
+                if rev.is_empty() {
+                    self.reverse.remove(&to);
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Removes all cross-channel dependencies of `(to_key, to_ch)`.
+    ///
+    /// Returns `true` if any edges existed and were removed.
+    pub fn clear_dependencies(&mut self, to_key: K, to_ch: Channel) -> bool {
+        let to = (to_key, to_ch);
+        let Some(sources) = self.reverse.remove(&to) else {
+            return false;
+        };
+
+        for from in sources {
+            if let Some(fwd) = self.forward.get_mut(&from) {
+                if let Some(pos) = fwd.iter().position(|e| *e == to) {
+                    fwd.swap_remove(pos);
+                }
+                if fwd.is_empty() {
+                    self.forward.remove(&from);
+                }
+            }
+        }
+
+        true
     }
 
     /// Returns an iterator over the cross-channel dependents of `(key, channel)`.
@@ -279,6 +368,56 @@ mod tests {
 
         let deps: Vec<_> = edges.dependents(1, LAYOUT).collect();
         assert_eq!(deps, vec![(3, COMPOSITE)]);
+    }
+
+    #[test]
+    fn replace_dependents_updates_outgoing_edges() {
+        let mut edges = CrossChannelEdges::<u32>::new();
+        edges.add_edge(1, LAYOUT, 2, PAINT);
+        edges.add_edge(1, LAYOUT, 3, COMPOSITE);
+
+        assert!(edges.replace_dependents(1, LAYOUT, [(3, COMPOSITE), (4, PAINT), (4, PAINT)]));
+
+        let deps: Vec<_> = edges.dependents(1, LAYOUT).collect();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&(3, COMPOSITE)));
+        assert!(deps.contains(&(4, PAINT)));
+
+        assert!(edges.dependencies(2, PAINT).next().is_none());
+        assert_eq!(
+            edges.dependencies(4, PAINT).collect::<Vec<_>>(),
+            vec![(1, LAYOUT)]
+        );
+
+        assert!(!edges.replace_dependents(1, LAYOUT, [(4, PAINT), (3, COMPOSITE)]));
+    }
+
+    #[test]
+    fn clear_dependents_removes_outgoing_edges() {
+        let mut edges = CrossChannelEdges::<u32>::new();
+        edges.add_edge(1, LAYOUT, 2, PAINT);
+        edges.add_edge(1, LAYOUT, 3, COMPOSITE);
+
+        assert!(edges.clear_dependents(1, LAYOUT));
+        assert!(!edges.clear_dependents(1, LAYOUT));
+
+        assert!(edges.dependents(1, LAYOUT).next().is_none());
+        assert!(edges.dependencies(2, PAINT).next().is_none());
+        assert!(edges.dependencies(3, COMPOSITE).next().is_none());
+    }
+
+    #[test]
+    fn clear_dependencies_removes_incoming_edges() {
+        let mut edges = CrossChannelEdges::<u32>::new();
+        edges.add_edge(1, LAYOUT, 3, PAINT);
+        edges.add_edge(2, COMPOSITE, 3, PAINT);
+
+        assert!(edges.clear_dependencies(3, PAINT));
+        assert!(!edges.clear_dependencies(3, PAINT));
+
+        assert!(edges.dependencies(3, PAINT).next().is_none());
+        assert!(edges.dependents(1, LAYOUT).next().is_none());
+        assert!(edges.dependents(2, COMPOSITE).next().is_none());
     }
 
     #[test]

@@ -345,6 +345,37 @@ where
             .remove_edge(from_key, from_ch, to_key, to_ch)
     }
 
+    /// Replaces all cross-channel dependents of `(from_key, from_ch)`.
+    ///
+    /// This updates the outgoing cross-channel edge set from one `(key,
+    /// channel)` pair. Existing targets not present in `targets` are removed,
+    /// new targets are added, and duplicates in `targets` are ignored.
+    ///
+    /// Returns `true` if the dependent set changed.
+    pub fn replace_cross_dependents(
+        &mut self,
+        from_key: K,
+        from_ch: Channel,
+        targets: impl IntoIterator<Item = (K, Channel)>,
+    ) -> bool {
+        self.cross_channel
+            .replace_dependents(from_key, from_ch, targets)
+    }
+
+    /// Removes all outgoing cross-channel edges from `(from_key, from_ch)`.
+    ///
+    /// Returns `true` if any edges existed and were removed.
+    pub fn clear_cross_dependents(&mut self, from_key: K, from_ch: Channel) -> bool {
+        self.cross_channel.clear_dependents(from_key, from_ch)
+    }
+
+    /// Removes all incoming cross-channel edges to `(to_key, to_ch)`.
+    ///
+    /// Returns `true` if any edges existed and were removed.
+    pub fn clear_cross_dependencies(&mut self, to_key: K, to_ch: Channel) -> bool {
+        self.cross_channel.clear_dependencies(to_key, to_ch)
+    }
+
     /// Returns a reference to the cross-channel edges.
     #[inline]
     #[must_use]
@@ -1095,6 +1126,48 @@ mod tests {
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
         assert!(!tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn cross_channel_replace_dependents() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 3, COMPOSITE);
+
+        assert!(tracker.replace_cross_dependents(1, LAYOUT, [(3, COMPOSITE), (4, PAINT)]));
+        assert!(!tracker.replace_cross_dependents(1, LAYOUT, [(4, PAINT), (3, COMPOSITE)]));
+
+        tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+        assert!(!tracker.is_invalidated(2, PAINT));
+        assert!(tracker.is_invalidated(3, COMPOSITE));
+        assert!(tracker.is_invalidated(4, PAINT));
+    }
+
+    #[test]
+    fn cross_channel_clear_dependents_and_dependencies() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cross_dependency(1, LAYOUT, 3, PAINT);
+        tracker.add_cross_dependency(2, COMPOSITE, 3, PAINT);
+
+        assert!(tracker.clear_cross_dependents(1, LAYOUT));
+        assert!(!tracker.clear_cross_dependents(1, LAYOUT));
+        assert!(
+            tracker
+                .cross_channel()
+                .dependencies(3, PAINT)
+                .eq([(2, COMPOSITE)])
+        );
+
+        assert!(tracker.clear_cross_dependencies(3, PAINT));
+        assert!(!tracker.clear_cross_dependencies(3, PAINT));
+        assert!(
+            tracker
+                .cross_channel()
+                .dependents(2, COMPOSITE)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
