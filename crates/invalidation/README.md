@@ -100,7 +100,8 @@ channel cascades.
 Use the tracker for the common case. `ChannelCascade` and `CrossChannelEdges`
 are the standalone primitives; `InvalidationTracker` owns them and applies them
 as part of marking. See the runnable `cascade_cross_channel` example for the
-same workflow in a complete program.
+same workflow in a complete program, and `retained_pipeline` for a node-scoped
+multi-phase example.
 
 ```rust
 use invalidation::{Channel, EagerPolicy, InvalidationTracker};

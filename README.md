@@ -51,6 +51,7 @@ Runnable examples:
 - `cargo run -p invalidation_examples --bin tracker_basics`
 - `cargo run -p invalidation_examples --bin eager_vs_lazy`
 - `cargo run -p invalidation_examples --bin cascade_cross_channel`
+- `cargo run -p invalidation_examples --bin retained_pipeline`
 - `cargo run -p invalidation_examples --bin tracing`
 - `cargo run -p invalidation_examples --bin interner`
 
