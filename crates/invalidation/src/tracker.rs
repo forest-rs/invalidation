@@ -224,10 +224,6 @@ where
         self.cycle_handling = handling;
     }
 
-    // -------------------------------------------------------------------------
-    // Graph operations
-    // -------------------------------------------------------------------------
-
     /// Adds a dependency: `from` depends on `to` in the given channel.
     ///
     /// Uses the tracker's configured cycle handling mode.
@@ -301,10 +297,6 @@ where
         self.graph.replace_dependencies(from, channel, to, handling)
     }
 
-    // -------------------------------------------------------------------------
-    // Channel cascade operations
-    // -------------------------------------------------------------------------
-
     /// Adds a channel cascade rule: invalidation on `from` also marks `to`.
     ///
     /// Returns `Ok(true)` if the rule was newly added, `Ok(false)` if it
@@ -329,10 +321,6 @@ where
     pub fn cascade(&self) -> &ChannelCascade {
         &self.cascade
     }
-
-    // -------------------------------------------------------------------------
-    // Cross-channel edge operations
-    // -------------------------------------------------------------------------
 
     /// Adds a cross-channel dependency edge.
     ///
@@ -371,10 +359,6 @@ where
     pub fn cross_channel(&self) -> &CrossChannelEdges<K> {
         &self.cross_channel
     }
-
-    // -------------------------------------------------------------------------
-    // Invalidation marking
-    // -------------------------------------------------------------------------
 
     /// Marks a key as invalidated without propagation.
     ///
@@ -482,10 +466,6 @@ where
     pub fn is_clean(&self) -> bool {
         self.invalidated.is_empty()
     }
-
-    // -------------------------------------------------------------------------
-    // Draining
-    // -------------------------------------------------------------------------
 
     /// Drains invalidated keys in topological order using Kahn's algorithm.
     ///
@@ -613,10 +593,6 @@ where
         self.invalidated.clear_all();
     }
 
-    // -------------------------------------------------------------------------
-    // Multi-channel drain
-    // -------------------------------------------------------------------------
-
     /// Drains invalidated keys across channels in the given order.
     ///
     /// Within each channel, keys are yielded in topological order (like
@@ -650,10 +626,6 @@ where
         }
         results
     }
-
-    // -------------------------------------------------------------------------
-    // Cross-channel queries
-    // -------------------------------------------------------------------------
 
     /// Returns all transitive dependents following same-channel edges,
     /// cascades, and cross-channel edges.
@@ -994,10 +966,6 @@ mod tests {
         assert!(tracker.is_clean());
     }
 
-    // -----------------------------------------------------------------------
-    // Cascade tests (Phase 2)
-    // -----------------------------------------------------------------------
-
     const COMPOSITE: Channel = Channel::new(2);
 
     #[test]
@@ -1088,10 +1056,6 @@ mod tests {
         assert!(tracker.cascade().cascades_from(LAYOUT).contains(PAINT));
     }
 
-    // -----------------------------------------------------------------------
-    // Cross-channel edge tests (Phase 3)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn cross_channel_mark_with_follows_edges() {
         let mut tracker = InvalidationTracker::<u32>::new();
@@ -1170,10 +1134,6 @@ mod tests {
         assert!(!tracker.cross_channel().is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // Multi-channel drain tests (Phase 4)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn drain_channels_sorted_basic() {
         let mut tracker = InvalidationTracker::<u32>::new();
@@ -1216,10 +1176,6 @@ mod tests {
         assert!(!tracker.has_invalidated(LAYOUT));
         assert!(!tracker.has_invalidated(PAINT));
     }
-
-    // -----------------------------------------------------------------------
-    // Cross-channel transitive query tests (Phase 5)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn transitive_dependents_cross_same_channel_only() {
@@ -1296,11 +1252,6 @@ mod tests {
             .count();
         assert_eq!(paint_count, 1);
     }
-
-    // -----------------------------------------------------------------------
-    // Closure-depth tests: these probe multi-hop and chained semantics
-    // that the original one-hop tests missed.
-    // -----------------------------------------------------------------------
 
     #[test]
     fn cross_channel_from_propagated_dependent_not_just_root() {
