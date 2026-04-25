@@ -3,10 +3,20 @@
 
 //! Invalidation: generic primitives for dependency-aware invalidation.
 //!
-//! This crate provides building blocks for incremental computation systems
-//! where changes to upstream data must propagate to downstream consumers.
-//! It models invalidation as a combination of:
+//! This crate helps incremental systems track what changed, propagate that
+//! invalidation through dependency edges, and drain the affected work in a
+//! clear order.
 //!
+//! Most applications should start with [`InvalidationTracker`]. It is the
+//! coordinator that owns dependency edges, invalidation state, channel
+//! cascades, cross-channel edges, and drain entry points.
+//!
+//! The lower-level pieces are available when an embedder already owns part of
+//! that coordination:
+//!
+//! - **Tracker** ([`InvalidationTracker`]): The common high-level API for
+//!   graph mutation, marking, propagation, cascades, cross-channel edges, and
+//!   draining.
 //! - **Channels** ([`Channel`], [`ChannelSet`]): Named domains for invalidation
 //!   tracking (for example, layout, paint, accessibility).
 //! - **Dependency graphs** ([`InvalidationGraph`]): DAG of "A depends on B" edges,
