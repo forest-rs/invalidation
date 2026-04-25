@@ -7,6 +7,12 @@
 //! also mark it on channel B" rules. The transitive closure is precomputed on
 //! every mutation so that [`cascades_from`](ChannelCascade::cascades_from) is a
 //! single bitfield read at mark time.
+//!
+//! Most callers should configure cascades through
+//! [`InvalidationTracker::add_cascade`](crate::InvalidationTracker::add_cascade)
+//! so the tracker applies them whenever keys are marked. Use
+//! [`ChannelCascade`] directly when embedding these rules in a custom
+//! coordinator.
 
 use core::fmt;
 
@@ -56,7 +62,23 @@ impl core::error::Error for CascadeCycleError {}
 /// / [`remove_cascade`](Self::remove_cascade) call (at most 64×64 = 4096 ops),
 /// so [`cascades_from`](Self::cascades_from) is a single bitfield read.
 ///
-/// # Example
+/// # Common tracker usage
+///
+/// ```
+/// use invalidation::{Channel, InvalidationTracker};
+///
+/// const LAYOUT: Channel = Channel::new(0);
+/// const PAINT: Channel = Channel::new(1);
+///
+/// let mut tracker = InvalidationTracker::<u32>::new();
+/// tracker.add_cascade(LAYOUT, PAINT).unwrap();
+///
+/// tracker.mark(1, LAYOUT);
+/// assert!(tracker.is_invalidated(1, LAYOUT));
+/// assert!(tracker.is_invalidated(1, PAINT));
+/// ```
+///
+/// # Standalone usage
 ///
 /// ```
 /// use invalidation::{Channel, ChannelCascade};

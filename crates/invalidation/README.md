@@ -85,6 +85,33 @@ let ordered: Vec<_> = lazy.drain_affected_sorted(LAYOUT).collect();
 assert_eq!(ordered, vec![1, 2, 3]);
 ```
 
+## Cascades And Cross-Channel Edges
+
+Use the tracker for the common case. `ChannelCascade` and `CrossChannelEdges`
+are the standalone primitives; `InvalidationTracker` owns them and applies them
+as part of marking.
+
+```rust
+use invalidation::{Channel, EagerPolicy, InvalidationTracker};
+
+const LAYOUT: Channel = Channel::new(0);
+const PAINT: Channel = Channel::new(1);
+
+let mut tracker = InvalidationTracker::<u32>::new();
+
+// Same key, different channel: invalidating layout also invalidates paint.
+tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+// Different key and channel: node 1 layout feeds node 2 paint.
+tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+
+tracker.mark_with(1, LAYOUT, &EagerPolicy);
+
+assert!(tracker.is_invalidated(1, LAYOUT));
+assert!(tracker.is_invalidated(1, PAINT));
+assert!(tracker.is_invalidated(2, PAINT));
+```
+
 ## Deterministic And Targeted Drains
 
 When ties must be stable, or you only want to process part of the invalidated

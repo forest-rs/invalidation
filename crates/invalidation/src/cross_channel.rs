@@ -6,6 +6,12 @@
 //! [`CrossChannelEdges`] stores sparse edges of the form
 //! `(key_a, channel_a) → (key_b, channel_b)`, modeling dependencies like
 //! "node A's LAYOUT output feeds node B's PAINT input".
+//!
+//! Most callers should configure cross-channel edges through
+//! [`InvalidationTracker::add_cross_dependency`](crate::InvalidationTracker::add_cross_dependency)
+//! so the tracker follows them during [`mark_with`](crate::InvalidationTracker::mark_with).
+//! Use [`CrossChannelEdges`] directly when embedding these edges in a custom
+//! coordinator.
 
 use alloc::vec::Vec;
 use core::hash::Hash;
@@ -23,7 +29,25 @@ use crate::channel::Channel;
 /// Cross-channel edges are expected to be uncommon relative to same-channel
 /// edges, so storage is sparse (hash maps).
 ///
-/// # Example
+/// # Common tracker usage
+///
+/// ```
+/// use invalidation::{Channel, EagerPolicy, InvalidationTracker};
+///
+/// const LAYOUT: Channel = Channel::new(0);
+/// const PAINT: Channel = Channel::new(1);
+///
+/// let mut tracker = InvalidationTracker::<u32>::new();
+///
+/// // Node 1's LAYOUT invalidation feeds node 2's PAINT.
+/// tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+///
+/// tracker.mark_with(1, LAYOUT, &EagerPolicy);
+/// assert!(tracker.is_invalidated(1, LAYOUT));
+/// assert!(tracker.is_invalidated(2, PAINT));
+/// ```
+///
+/// # Standalone usage
 ///
 /// ```
 /// use invalidation::{Channel, CrossChannelEdges};
