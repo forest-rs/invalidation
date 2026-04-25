@@ -89,7 +89,8 @@ assert_eq!(ordered, vec![1, 2, 3]);
 
 Use the tracker for the common case. `ChannelCascade` and `CrossChannelEdges`
 are the standalone primitives; `InvalidationTracker` owns them and applies them
-as part of marking.
+as part of marking. See the runnable `cascade_cross_channel` example for the
+same workflow in a complete program.
 
 ```rust
 use invalidation::{Channel, EagerPolicy, InvalidationTracker};
