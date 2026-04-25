@@ -4,17 +4,14 @@
 [`crates/invalidation`](./crates/invalidation), a `no_std` crate for generic
 dependency-aware invalidation.
 
-It is intended for incremental systems where upstream changes propagate through
-a dependency graph and downstream work should be processed in explicit order.
+It is intended for incremental systems where upstream changes must mark
+downstream work dirty, then process that work in a clear dependency order.
 
-Core pieces:
-
-- `Channel` and `ChannelSet`
-- `InvalidationGraph`
-- `InvalidationSet`
-- `EagerPolicy` and `LazyPolicy`
-- `InvalidationTracker`
-- `DrainBuilder` and sorted drain helpers
+Most applications should start with `InvalidationTracker`. It coordinates the
+dependency graph, invalidated keys, channel cascades, cross-channel edges, and
+drain entry points. Lower-level pieces such as `InvalidationGraph`,
+`InvalidationSet`, and `DrainBuilder` are available when an embedder already
+owns part of that coordination.
 
 ## Quick Start
 
@@ -32,6 +29,20 @@ tracker.mark_with(1, LAYOUT, &EagerPolicy);
 let ordered: Vec<_> = tracker.drain_sorted(LAYOUT).collect();
 assert_eq!(ordered, vec![1, 2, 3]);
 ```
+
+## Common Workflows
+
+| Goal | Use |
+| --- | --- |
+| Mark and eagerly propagate one changed key | `InvalidationTracker::mark_with` + `EagerPolicy` |
+| Mark roots now and expand affected work later | `LazyPolicy` + `drain_affected_sorted` |
+| Process work in dependency order | `drain_sorted` |
+| Break ties deterministically | `tracker.drain(channel).deterministic().run()` |
+| Limit a drain to part of the graph | `DrainBuilder::within_keys` or `DrainBuilder::within_dependencies_of` |
+| Cascade one key across channels | `InvalidationTracker::add_cascade` |
+| Connect different keys across channels | `InvalidationTracker::add_cross_dependency` |
+| Use owned or sparse domain keys | `intern::Interner` |
+| Explain why a key was invalidated | `OneParentRecorder` with tracing APIs |
 
 ## Examples
 
