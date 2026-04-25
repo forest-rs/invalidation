@@ -216,12 +216,6 @@ where
         self.cycle_handling
     }
 
-    /// Sets the cycle handling mode for future operations.
-    #[inline]
-    pub fn set_cycle_handling(&mut self, handling: CycleHandling) {
-        self.cycle_handling = handling;
-    }
-
     /// Adds a dependency: `from` depends on `to` in the given channel.
     ///
     /// Uses the tracker's configured cycle handling mode.
@@ -902,18 +896,15 @@ mod tests {
     }
 
     #[test]
-    fn cycle_handling_modes() {
+    fn explicit_cycle_handling_can_override_tracker_default() {
         let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
 
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
 
-        // Self-cycle should error
         let result = tracker.add_dependency(1, 1, LAYOUT);
         assert!(result.is_err());
 
-        // Change to ignore mode
-        tracker.set_cycle_handling(CycleHandling::Ignore);
-        let result = tracker.add_dependency(1, 1, LAYOUT);
+        let result = tracker.add_dependency_with(1, 1, LAYOUT, CycleHandling::Ignore);
         assert!(result.is_ok());
     }
 

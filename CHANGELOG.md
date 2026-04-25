@@ -23,6 +23,11 @@ You can find its changes [documented below](#011-2026-04-05).
   `mark_with`, `clear`, `clear_all`, and drain methods for coordinated
   invalidation state changes, or use a standalone `InvalidationSet` with the
   free drain helpers when bypassing tracker orchestration is intentional.
+- Removed `InvalidationTracker::set_cycle_handling`. Use
+  `InvalidationTracker::with_cycle_handling` or
+  `InvalidationTracker::from_graph_with_cycle_handling` to choose the tracker's
+  default, and use `add_dependency_with` or `replace_dependencies_with` when an
+  operation needs a different cycle policy.
 
 ## [0.1.1][] (2026-04-05)
 
