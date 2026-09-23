@@ -68,6 +68,10 @@ enum Within<'w, K> {
 /// The `within_*` methods provide targeted drains that do **not** require the
 /// “global drain then restore” pattern: invalidated roots outside the target
 /// remain invalidated for subsequent drains.
+///
+/// An affected targeted drain expands dependents only inside its scope. Use
+/// [`DrainBuilder::retain_out_of_scope`] to keep dependents of drained keys
+/// that lie outside the scope invalidated, rather than losing their work.
 pub struct DrainBuilder<'d, 'g, 's, K, O = AnyOrder>
 where
     K: Copy + Eq + Hash + DenseKey,
@@ -77,6 +81,7 @@ where
     channel: Channel,
     mode: DrainMode,
     within: Within<'d, K>,
+    out_of_scope: Option<&'d mut Vec<(K, K)>>,
     scratch: Option<&'s mut TraversalScratch<K>>,
     trace: Option<&'s mut dyn InvalidationTrace<K>>,
     _order: PhantomData<O>,
@@ -90,6 +95,7 @@ where
         f.debug_struct("DrainBuilder")
             .field("channel", &self.channel)
             .field("mode", &self.mode)
+            .field("retains_out_of_scope", &self.out_of_scope.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -109,6 +115,7 @@ where
             channel,
             mode: DrainMode::InvalidatedOnly,
             within: Within::All,
+            out_of_scope: None,
             scratch: None,
             trace: None,
             _order: PhantomData,
@@ -163,6 +170,47 @@ where
         self
     }
 
+    /// Keeps dependents of drained keys that lie outside a targeted drain's
+    /// scope invalidated, and reports them.
+    ///
+    /// An [`affected`](DrainBuilder::affected) drain restricted by
+    /// [`within_keys`](DrainBuilder::within_keys) or
+    /// [`within_dependencies_of`](DrainBuilder::within_dependencies_of) takes
+    /// every invalidated root inside the scope but expands dependents only
+    /// inside it. Without this option, a key outside the scope that depends on
+    /// a drained key (for example a sibling of the target reading the same
+    /// root) is never marked, so under [`LazyPolicy`](crate::LazyPolicy) its
+    /// pending work is lost.
+    ///
+    /// With this option, every **direct** dependent of a drained key that lies
+    /// outside the scope is marked invalidated in this channel, and each such
+    /// `(dependent, drained key)` edge is appended to `out_of_scope`. Lazy
+    /// expansion from those marks covers their own dependents on a later
+    /// affected drain. The pairs let callers attach causes, for example to
+    /// explain the retained work from its real root. With
+    /// [`deterministic`](DrainBuilder::deterministic) the appended pairs are
+    /// sorted by `(dependent, drained key)`; otherwise their order is
+    /// unspecified.
+    ///
+    /// This has no effect on untargeted drains, which leave nothing outside
+    /// their scope, or on [`invalidated_only`](DrainBuilder::invalidated_only)
+    /// drains, which never take responsibility for dependents. Marking is
+    /// idempotent, so keys already invalidated (for example by
+    /// [`EagerPolicy`](crate::EagerPolicy)) are simply reported again.
+    ///
+    /// Retained keys are marked directly in the invalidated set, without the
+    /// tracker's channel cascades: a key that
+    /// [`InvalidationTracker::mark`](crate::InvalidationTracker::mark) would
+    /// cascade to other channels is marked in this channel only. They are
+    /// also not reported to a [`trace`](DrainBuilder::trace) recorder; the
+    /// pairs appended to `out_of_scope` are the only record of why they were
+    /// retained.
+    #[must_use]
+    pub fn retain_out_of_scope(mut self, out_of_scope: &'d mut Vec<(K, K)>) -> Self {
+        self.out_of_scope = Some(out_of_scope);
+        self
+    }
+
     /// Reuses `scratch` for internal traversals (affected expansion, targeted
     /// dependency closure computation).
     ///
@@ -179,6 +227,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             trace,
             ..
         } = self;
@@ -192,6 +241,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             scratch: Some(scratch),
             trace: None,
             _order: PhantomData,
@@ -221,6 +271,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             ..
         } = self;
         DrainBuilder {
@@ -229,6 +280,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             scratch: Some(scratch),
             trace: Some(trace),
             _order: PhantomData,
@@ -252,6 +304,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             scratch,
             trace,
             ..
@@ -262,6 +315,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             scratch,
             trace,
             _order: PhantomData,
@@ -337,6 +391,35 @@ where
                 roots
             }
         }
+    }
+
+    /// Marks and reports dependents of `drained` that lie outside `within`.
+    ///
+    /// Returns the index in `out` where this drain's pairs start.
+    fn retain_out_of_scope_dependents(
+        invalidated: &mut InvalidationSet<K>,
+        graph: &InvalidationGraph<K>,
+        channel: Channel,
+        within: &Within<'d, K>,
+        allowed: Option<&HashSet<K>>,
+        drained: &[K],
+        out: &mut Vec<(K, K)>,
+    ) -> usize {
+        let start = out.len();
+        if matches!(within, Within::All) {
+            return start;
+        }
+        for &because in drained {
+            for dependent in graph.dependents(because, channel) {
+                if !Self::is_allowed(within, dependent, allowed) {
+                    out.push((dependent, because));
+                }
+            }
+        }
+        for &(dependent, _) in &out[start..] {
+            let _ = invalidated.mark(dependent, channel);
+        }
+        start
     }
 
     fn collect_affected<'t>(
@@ -438,6 +521,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             mut scratch,
             trace,
             ..
@@ -458,7 +542,20 @@ where
         let keys = match mode {
             DrainMode::InvalidatedOnly => roots,
             DrainMode::Affected => {
-                Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace)
+                let keys =
+                    Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace);
+                if let Some(out) = out_of_scope {
+                    let _ = Self::retain_out_of_scope_dependents(
+                        invalidated,
+                        graph,
+                        channel,
+                        &within,
+                        allowed,
+                        &keys,
+                        out,
+                    );
+                }
+                keys
             }
         };
 
@@ -479,6 +576,7 @@ where
             channel,
             mode,
             within,
+            out_of_scope,
             mut scratch,
             trace,
             ..
@@ -499,7 +597,21 @@ where
         let keys = match mode {
             DrainMode::InvalidatedOnly => roots,
             DrainMode::Affected => {
-                Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace)
+                let keys =
+                    Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace);
+                if let Some(out) = out_of_scope {
+                    let start = Self::retain_out_of_scope_dependents(
+                        invalidated,
+                        graph,
+                        channel,
+                        &within,
+                        allowed,
+                        &keys,
+                        out,
+                    );
+                    out[start..].sort_unstable();
+                }
+                keys
             }
         };
 
@@ -517,6 +629,7 @@ mod tests {
 
     use crate::CycleHandling;
     use crate::InvalidationTracker;
+    use crate::LazyPolicy;
     use crate::trace::OneParentRecorder;
 
     const LAYOUT: Channel = Channel::new(0);
@@ -581,6 +694,228 @@ mod tests {
 
         assert_eq!(order, vec![1, 2, 3]);
         assert_eq!(rec.explain_path(3, LAYOUT).unwrap(), vec![1, 2, 3]);
+    }
+
+    /// `a` and `b` both depend on `x`, `c` depends on `a`, and `q` depends on
+    /// `b`. A drain scoped to `c` takes `x` but must not lose `b` (and so `q`).
+    fn siblings(t: &mut InvalidationTracker<u32>) {
+        let (x, a, b, c, q) = (1, 2, 3, 4, 5);
+        t.add_dependency(a, x, LAYOUT).unwrap();
+        t.add_dependency(b, x, LAYOUT).unwrap();
+        t.add_dependency(c, a, LAYOUT).unwrap();
+        t.add_dependency(q, b, LAYOUT).unwrap();
+    }
+
+    #[test]
+    fn scoped_affected_drain_loses_siblings_by_default() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        siblings(&mut t);
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(4)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(order, vec![1, 2, 4]);
+        // The default keeps the historical behavior: `b` was never marked.
+        assert!(!t.is_invalidated(3, LAYOUT));
+        assert_eq!(t.drain(LAYOUT).affected().run().count(), 0);
+    }
+
+    #[test]
+    fn retain_out_of_scope_keeps_siblings_and_their_dependents() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        siblings(&mut t);
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let mut retained = Vec::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(4)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(order, vec![1, 2, 4]);
+        assert_eq!(retained, vec![(3, 1)]);
+        assert!(t.is_invalidated(3, LAYOUT));
+
+        // Lazy expansion from the retained mark reaches `q` behind it.
+        let rest: Vec<_> = t.drain(LAYOUT).affected().deterministic().run().collect();
+        assert_eq!(rest, vec![3, 5]);
+    }
+
+    #[test]
+    fn retain_out_of_scope_reports_every_boundary_edge_sorted() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        // Target 10 reads 1 and 2; outside readers: 20 reads 1 and 2, 30 reads 2.
+        for (from, to) in [(10, 1), (10, 2), (20, 1), (20, 2), (30, 2)] {
+            t.add_dependency(from, to, LAYOUT).unwrap();
+        }
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+        t.mark_with(2, LAYOUT, &LazyPolicy);
+
+        let mut retained = vec![(99, 99)];
+        let _ = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(10)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .count();
+        // Existing contents are kept; this drain's pairs are appended in order.
+        assert_eq!(retained, vec![(99, 99), (20, 1), (20, 2), (30, 2)]);
+    }
+
+    #[test]
+    fn retain_out_of_scope_applies_to_within_keys() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        siblings(&mut t);
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let scope = [1, 2, 4];
+        let mut retained = Vec::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_keys(&scope)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(order, vec![1, 2, 4]);
+        assert_eq!(retained, vec![(3, 1)]);
+        assert!(t.is_invalidated(3, LAYOUT));
+    }
+
+    #[test]
+    fn retain_out_of_scope_covers_scopes_not_closed_under_dependencies() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        // x <- a <- c, but the scope names only x and c.
+        let (x, a, c) = (1, 2, 3);
+        t.add_dependency(a, x, LAYOUT).unwrap();
+        t.add_dependency(c, a, LAYOUT).unwrap();
+        t.mark_with(x, LAYOUT, &LazyPolicy);
+
+        let scope = [x, c];
+        let mut retained = Vec::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_keys(&scope)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        // Expansion stops at `a`, which lies outside the scope; `c` is only
+        // reachable through it.
+        assert_eq!(order, vec![x]);
+        assert_eq!(retained, vec![(a, x)]);
+
+        let rest: Vec<_> = t.drain(LAYOUT).affected().deterministic().run().collect();
+        assert_eq!(rest, vec![a, c]);
+    }
+
+    #[test]
+    fn chained_scoped_drains_drain_every_key_once() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        // x <- a <- t1, a <- b <- t2, b <- q.
+        let (x, a, t1, b, t2, q) = (1, 2, 3, 4, 5, 6);
+        t.add_dependency(a, x, LAYOUT).unwrap();
+        t.add_dependency(t1, a, LAYOUT).unwrap();
+        t.add_dependency(b, a, LAYOUT).unwrap();
+        t.add_dependency(t2, b, LAYOUT).unwrap();
+        t.add_dependency(q, b, LAYOUT).unwrap();
+        t.mark_with(x, LAYOUT, &LazyPolicy);
+
+        let mut retained = Vec::new();
+        let first: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(t1)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(first, vec![x, a, t1]);
+        assert_eq!(retained, vec![(b, a)]);
+
+        retained.clear();
+        let second: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(t2)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(second, vec![b, t2]);
+        assert_eq!(retained, vec![(q, b)]);
+
+        let rest: Vec<_> = t.drain(LAYOUT).affected().deterministic().run().collect();
+        assert_eq!(rest, vec![q]);
+    }
+
+    #[test]
+    fn retain_out_of_scope_is_idempotent_under_eager_marking() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        siblings(&mut t);
+        // Eager marking already invalidated every dependent, including `b` and `q`.
+        t.mark_with(1, LAYOUT, &crate::EagerPolicy);
+
+        let mut retained = Vec::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(4)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(order, vec![1, 2, 4]);
+        assert_eq!(retained, vec![(3, 1)]);
+        let rest: Vec<_> = t
+            .drain(LAYOUT)
+            .invalidated_only()
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(rest, vec![3, 5]);
+    }
+
+    #[test]
+    fn retain_out_of_scope_ignores_untargeted_and_invalidated_only_drains() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        siblings(&mut t);
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let mut retained = Vec::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .invalidated_only()
+            .within_dependencies_of(4)
+            .retain_out_of_scope(&mut retained)
+            .run()
+            .collect();
+        assert_eq!(order, vec![1]);
+        assert!(retained.is_empty());
+
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+        let all: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(all, vec![1, 2, 3, 4, 5]);
+        assert!(retained.is_empty());
+        assert_eq!(t.drain(LAYOUT).affected().run().count(), 0);
     }
 
     #[test]

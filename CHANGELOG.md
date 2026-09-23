@@ -13,6 +13,15 @@ You can find its changes [documented below](#020-2026-04-25).
 
 ## [Unreleased]
 
+### Added
+
+- Added `DrainBuilder::retain_out_of_scope`. A targeted affected drain
+  (`within_keys` or `within_dependencies_of`) expands dependents only inside
+  its scope, so under `LazyPolicy` a key outside the scope that depends on a
+  drained key lost its pending work. With this option the drain marks each such
+  direct dependent invalidated and reports the `(dependent, drained key)` edges
+  so callers can attach causes. The default behavior is unchanged.
+
 ## [0.2.0][] (2026-04-25)
 
 This release has an [MSRV][] of 1.88.
