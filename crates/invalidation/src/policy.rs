@@ -10,7 +10,7 @@ use crate::drain::DenseKey;
 use crate::graph::InvalidationGraph;
 use crate::scratch::TraversalScratch;
 use crate::set::InvalidationSet;
-use crate::trace::InvalidationTrace;
+use crate::trace::{InvalidationCause, InvalidationTrace};
 
 /// Trait for invalidation propagation policies.
 ///
@@ -77,6 +77,32 @@ where
         graph: &InvalidationGraph<K>,
         invalidated: &mut InvalidationSet<K>,
     );
+
+    /// Propagates like [`propagate`](Self::propagate), while reporting each
+    /// `(key, channel)` it reaches to `trace`.
+    ///
+    /// The root is reported with [`InvalidationCause::Root`], and each
+    /// dependent with the [`InvalidationCause::Dependency`] it was reached
+    /// through. `scratch` is available for the traversal.
+    ///
+    /// The default implementation runs [`propagate`](Self::propagate) and
+    /// reports only the root, which is complete for policies that mark only
+    /// the root (like [`LazyPolicy`]). Policies that mark dependents should
+    /// override it to report them, as [`EagerPolicy`] does.
+    fn propagate_with_trace(
+        &self,
+        key: K,
+        channel: Channel,
+        graph: &InvalidationGraph<K>,
+        invalidated: &mut InvalidationSet<K>,
+        scratch: &mut TraversalScratch<K>,
+        trace: &mut dyn InvalidationTrace<K>,
+    ) {
+        let _ = scratch;
+        let newly_invalidated = !invalidated.is_invalidated(key, channel);
+        self.propagate(key, channel, graph, invalidated);
+        trace.record(key, channel, InvalidationCause::Root, newly_invalidated);
+    }
 }
 
 /// Eager propagation policy: immediately mark all transitive dependents.
@@ -133,6 +159,46 @@ where
             invalidated.mark(dependent, channel);
         }
     }
+
+    /// Propagates eagerly while reporting the root and one edge per
+    /// discovered dependent.
+    ///
+    /// This is intended for debugging and explainability ("why is this key
+    /// invalidated?"). It is not a complete provenance system: it reports the
+    /// traversal observed by this call. It reuses `scratch` to avoid per-call
+    /// allocations.
+    fn propagate_with_trace(
+        &self,
+        key: K,
+        channel: Channel,
+        graph: &InvalidationGraph<K>,
+        invalidated: &mut InvalidationSet<K>,
+        scratch: &mut TraversalScratch<K>,
+        trace: &mut dyn InvalidationTrace<K>,
+    ) {
+        let newly_invalidated = invalidated.mark(key, channel);
+        trace.record(key, channel, InvalidationCause::Root, newly_invalidated);
+
+        scratch.reset();
+        scratch.stack.push(key);
+        scratch.visited.insert(key);
+
+        while let Some(current) = scratch.stack.pop() {
+            for dependent in graph.dependents(current, channel) {
+                if !scratch.visited.insert(dependent) {
+                    continue;
+                }
+                let newly_invalidated = invalidated.mark(dependent, channel);
+                trace.record(
+                    dependent,
+                    channel,
+                    InvalidationCause::Dependency { key: current },
+                    newly_invalidated,
+                );
+                scratch.stack.push(dependent);
+            }
+        }
+    }
 }
 
 impl EagerPolicy {
@@ -159,49 +225,6 @@ impl EagerPolicy {
         graph.for_each_transitive_dependent(key, channel, scratch, |dependent| {
             invalidated.mark(dependent, channel);
         });
-    }
-
-    /// Propagates while recording a best-effort explanation trace.
-    ///
-    /// This performs an eager traversal over transitive dependents (like
-    /// [`PropagationPolicy::propagate`]) while calling `trace` with the explicit
-    /// root and one edge per discovered dependent.
-    ///
-    /// The trace is intended for debugging/explainability (e.g. "why is this key
-    /// invalidated?"). It is not a complete provenance system: it records the
-    /// traversal observed by this call.
-    ///
-    /// To avoid per-call allocations in hot loops, this method reuses the given
-    /// [`TraversalScratch`].
-    pub fn propagate_with_trace<K, T>(
-        &self,
-        key: K,
-        channel: Channel,
-        graph: &InvalidationGraph<K>,
-        invalidated: &mut InvalidationSet<K>,
-        scratch: &mut TraversalScratch<K>,
-        trace: &mut T,
-    ) where
-        K: Copy + Eq + Hash + DenseKey,
-        T: InvalidationTrace<K>,
-    {
-        let newly_invalidated = invalidated.mark(key, channel);
-        trace.root(key, channel, newly_invalidated);
-
-        scratch.reset();
-        scratch.stack.push(key);
-        scratch.visited.insert(key);
-
-        while let Some(current) = scratch.stack.pop() {
-            for dependent in graph.dependents(current, channel) {
-                if !scratch.visited.insert(dependent) {
-                    continue;
-                }
-                let newly_invalidated = invalidated.mark(dependent, channel);
-                trace.caused_by(dependent, current, channel, newly_invalidated);
-                scratch.stack.push(dependent);
-            }
-        }
     }
 }
 
@@ -287,6 +310,18 @@ where
         invalidated: &mut InvalidationSet<K>,
     ) {
         (*self).propagate(key, channel, graph, invalidated);
+    }
+
+    fn propagate_with_trace(
+        &self,
+        key: K,
+        channel: Channel,
+        graph: &InvalidationGraph<K>,
+        invalidated: &mut InvalidationSet<K>,
+        scratch: &mut TraversalScratch<K>,
+        trace: &mut dyn InvalidationTrace<K>,
+    ) {
+        (*self).propagate_with_trace(key, channel, graph, invalidated, scratch, trace);
     }
 }
 
