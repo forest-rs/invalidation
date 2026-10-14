@@ -179,6 +179,7 @@
 
 extern crate alloc;
 
+mod adaptive;
 mod cascade;
 mod channel;
 mod cross_channel;

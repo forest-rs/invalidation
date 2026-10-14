@@ -984,10 +984,8 @@ where
     /// times or want to keep the invalidation state.
     #[must_use]
     pub fn peek_sorted(&self, channel: Channel) -> DrainSorted<'_, K> {
-        let cap = self.invalidated.len(channel);
-        DrainSorted::from_iter_with_capacity(
-            self.invalidated.iter(channel),
-            cap,
+        DrainSorted::from_keys(
+            self.invalidated.iter(channel).collect(),
             &self.graph,
             channel,
         )
@@ -1224,10 +1222,8 @@ where
     /// not clear the invalidation set.
     #[must_use]
     pub fn peek_sorted_deterministic(&self, channel: Channel) -> DrainSortedDeterministic<'_, K> {
-        let cap = self.invalidated.len(channel);
-        DrainSortedDeterministic::from_iter_with_capacity(
-            self.invalidated.iter(channel),
-            cap,
+        DrainSortedDeterministic::from_keys(
+            self.invalidated.iter(channel).collect(),
             &self.graph,
             channel,
         )

@@ -718,9 +718,7 @@ where
     /// marked invalidated again when it is dropped. See [`DrainSorted`].
     pub fn run(self) -> DrainSorted<'d, K> {
         let (keys, invalidated, graph, channel) = self.take_keys(|_| {});
-        let cap = keys.len();
-        DrainSorted::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
-            .returning_to(invalidated)
+        DrainSorted::from_keys(keys, graph, channel).returning_to(invalidated)
     }
 }
 
@@ -735,9 +733,7 @@ where
     pub fn run(self) -> DrainSortedDeterministic<'d, K> {
         let (keys, invalidated, graph, channel) =
             self.take_keys(|retained| retained.sort_unstable());
-        let cap = keys.len();
-        DrainSortedDeterministic::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
-            .returning_to(invalidated)
+        DrainSortedDeterministic::from_keys(keys, graph, channel).returning_to(invalidated)
     }
 }
 
