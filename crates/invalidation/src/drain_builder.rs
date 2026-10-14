@@ -36,6 +36,7 @@ use crate::DrainSortedDeterministic;
 use crate::InvalidationGraph;
 use crate::InvalidationSet;
 use crate::TraversalScratch;
+use crate::adaptive::KeySet;
 use crate::cascade::ChannelCascade;
 use crate::cross_channel::CrossChannelEdges;
 use crate::trace::{InvalidationCause, InvalidationTrace};
@@ -433,11 +434,11 @@ impl<'d, 'g, 's, K, O> DrainBuilder<'d, 'g, 's, K, O>
 where
     K: Copy + Eq + Hash + DenseKey,
 {
-    fn is_allowed(within: &Within<'d, K>, key: K, allowed: Option<&HashSet<K>>) -> bool {
+    fn is_allowed(within: &Within<'d, K>, key: K, allowed: Option<&KeySet<K>>) -> bool {
         match *within {
             Within::All => true,
             Within::Keys(keys) => keys.contains(&key),
-            Within::DependenciesOf(_) => allowed.is_some_and(|set| set.contains(&key)),
+            Within::DependenciesOf(_) => allowed.is_some_and(|set| set.contains(key)),
         }
     }
 
@@ -446,8 +447,8 @@ where
         channel: Channel,
         key: K,
         scratch: Option<&mut TraversalScratch<K>>,
-    ) -> HashSet<K> {
-        let mut allowed: HashSet<K> = HashSet::new();
+    ) -> KeySet<K> {
+        let mut allowed = KeySet::default();
         allowed.insert(key);
 
         match scratch {
@@ -482,7 +483,7 @@ where
         invalidated: &mut InvalidationSet<K>,
         channel: Channel,
         within: &Within<'d, K>,
-        allowed: Option<&HashSet<K>>,
+        allowed: Option<&KeySet<K>>,
     ) -> Vec<K> {
         match within {
             Within::All => invalidated.drain(channel).collect(),
@@ -507,7 +508,7 @@ where
         graph: &InvalidationGraph<K>,
         channel: Channel,
         within: &Within<'d, K>,
-        allowed: Option<&HashSet<K>>,
+        allowed: Option<&KeySet<K>>,
         drained: &[K],
         out: &mut Vec<(K, K)>,
     ) -> usize {
@@ -533,7 +534,7 @@ where
         channel: Channel,
         roots: Vec<K>,
         within: &Within<'d, K>,
-        allowed: Option<&HashSet<K>>,
+        allowed: Option<&KeySet<K>>,
         scratch: Option<&'t mut TraversalScratch<K>>,
         mut trace: Option<&'t mut dyn InvalidationTrace<K>>,
     ) -> Vec<K> {
@@ -553,7 +554,7 @@ where
                 )
             }
             None => {
-                let mut visited: HashSet<K> = HashSet::new();
+                let mut visited = KeySet::default();
                 let mut stack: Vec<K> = Vec::new();
                 Self::collect_affected_with_state(
                     graph,
@@ -574,9 +575,9 @@ where
         channel: Channel,
         roots: Vec<K>,
         within: &Within<'d, K>,
-        allowed: Option<&HashSet<K>>,
+        allowed: Option<&KeySet<K>>,
         stack: &mut Vec<K>,
-        visited: &mut HashSet<K>,
+        visited: &mut KeySet<K>,
         trace: &mut Option<&mut dyn InvalidationTrace<K>>,
     ) -> Vec<K> {
         let mut out = Vec::new();
