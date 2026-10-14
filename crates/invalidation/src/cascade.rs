@@ -14,6 +14,7 @@
 //! [`ChannelCascade`] directly when embedding these rules in a custom
 //! coordinator.
 
+use alloc::vec::Vec;
 use core::fmt;
 
 use crate::channel::{Channel, ChannelSet};
@@ -22,31 +23,32 @@ use crate::channel::{Channel, ChannelSet};
 const MAX_CHANNELS: usize = 64;
 
 /// Error returned when adding a cascade would create a cycle.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CascadeCycleError {
     /// The source channel of the cascade that would create a cycle.
     pub from: Channel,
     /// The target channel of the cascade that would create a cycle.
     pub to: Channel,
-}
-
-impl fmt::Debug for CascadeCycleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CascadeCycleError {{ from: {:?}, to: {:?} }}",
-            self.from, self.to
-        )
-    }
+    /// The existing cascade chain from `to` back to `from`.
+    ///
+    /// It starts with `to` and ends with `from`, and each channel cascades to
+    /// the next, so `from -> to` followed by this chain is the cycle. For a
+    /// self-cascade (`from == to`) it is just `[from]`.
+    pub path: Vec<Channel>,
 }
 
 impl fmt::Display for CascadeCycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "adding cascade {:?} -> {:?} would create a cycle",
-            self.from, self.to
-        )
+            "adding cascade {:?} -> {:?} would create a cycle: {:?}",
+            self.from, self.to, self.from
+        )?;
+        for channel in &self.path {
+            write!(f, " -> {channel:?}")?;
+        }
+        Ok(())
     }
 }
 
@@ -162,7 +164,11 @@ impl ChannelCascade {
     pub fn add_cascade(&mut self, from: Channel, to: Channel) -> Result<bool, CascadeCycleError> {
         // Self-cascade is a trivial cycle.
         if from == to {
-            return Err(CascadeCycleError { from, to });
+            return Err(CascadeCycleError {
+                from,
+                to,
+                path: alloc::vec![from],
+            });
         }
 
         // Already present?
@@ -173,7 +179,11 @@ impl ChannelCascade {
         // Would adding from -> to create a cycle?
         // That happens if `from` is reachable from `to` via existing direct edges.
         if self.is_reachable(to, from) {
-            return Err(CascadeCycleError { from, to });
+            return Err(CascadeCycleError {
+                from,
+                to,
+                path: self.cascade_path(to, from),
+            });
         }
 
         self.direct[from.index() as usize].insert(to);
@@ -218,6 +228,23 @@ impl ChannelCascade {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.direct.iter().all(|cs| cs.is_empty())
+    }
+
+    /// Returns a chain of direct cascades from `start` to `target`, which must
+    /// be reachable.
+    fn cascade_path(&self, start: Channel, target: Channel) -> Vec<Channel> {
+        let mut path = alloc::vec![start];
+        let mut current = start;
+        while current != target {
+            // Step to any direct target that is, or still reaches, `target`.
+            current = self
+                .direct_cascades_from(current)
+                .iter()
+                .find(|&next| next == target || self.cascades_from(next).contains(target))
+                .expect("`target` is reachable from `current`");
+            path.push(current);
+        }
+        path
     }
 
     /// Checks whether `target` is reachable from `start` via direct edges.
@@ -450,12 +477,16 @@ mod tests {
 
     #[test]
     fn cascade_cycle_error_display() {
-        let err = CascadeCycleError {
-            from: LAYOUT,
-            to: PAINT,
-        };
+        let mut cascade = ChannelCascade::new();
+        cascade.add_cascade(LAYOUT, PAINT).unwrap();
+        cascade.add_cascade(PAINT, COMPOSITE).unwrap();
+        let err = cascade.add_cascade(COMPOSITE, LAYOUT).unwrap_err();
+        assert_eq!(err.path, alloc::vec![LAYOUT, PAINT, COMPOSITE]);
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("cascade"));
-        assert!(msg.contains("cycle"));
+        assert_eq!(
+            msg,
+            "adding cascade Channel(2) -> Channel(0) would create a cycle: \
+             Channel(2) -> Channel(0) -> Channel(1) -> Channel(2)"
+        );
     }
 }

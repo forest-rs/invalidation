@@ -26,6 +26,8 @@ This release has an [MSRV][] of 1.88.
 - Added `remaining_keys` to `DrainSorted` and `DrainSortedDeterministic`,
   naming the keys a drain has not yielded, such as those behind a cycle after a
   stall.
+- Added `InvalidationGraph::dependency_path`, a shortest chain of dependencies
+  between two keys, answering "why does this key depend on that one?".
 
 ### Changed
 
@@ -38,6 +40,11 @@ This release has an [MSRV][] of 1.88.
 - Breaking: `InvalidationTracker::drain_channels_sorted` returns
   `DrainedChannels`, which lists the channels whose drain stalled alongside the
   drained keys.
+- Breaking: `CycleError` and `CascadeCycleError` carry the existing chain the
+  rejected edge would close (`path`), and their messages print the whole cycle.
+  Both are `#[non_exhaustive]`. With the default `CycleHandling::DebugAssert`,
+  the debug-build panic now names the keys, channel, and cycle instead of only
+  saying that one exists.
 
 ## [0.2.0][] (2026-04-25)
 

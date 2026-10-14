@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::hash::Hash;
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 use crate::channel::{Channel, ChannelSet};
 use crate::drain::{DenseKey, prepare_dense_growth};
@@ -17,7 +17,12 @@ use crate::scratch::TraversalScratch;
 const MAX_CHANNELS: usize = 64;
 
 /// Error returned when a cycle would be created by adding a dependency.
+///
+/// The error carries the existing chain of dependencies that the new edge
+/// would close, so the cycle can be reported and broken without searching the
+/// graph again.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CycleError<K> {
     /// The key that would depend on another.
     pub from: K,
@@ -25,15 +30,22 @@ pub struct CycleError<K> {
     pub to: K,
     /// The channel where the cycle would occur.
     pub channel: Channel,
+    /// The existing dependency chain from `to` back to `from`.
+    ///
+    /// It starts with `to` and ends with `from`, and each key depends on the
+    /// next one, so `from -> to` followed by this chain is the cycle. For a
+    /// self-dependency (`from == to`) it is just `[from]`.
+    pub path: Vec<K>,
 }
 
 impl<K: fmt::Debug> fmt::Debug for CycleError<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CycleError {{ from: {:?}, to: {:?}, channel: {:?} }}",
-            self.from, self.to, self.channel
-        )
+        f.debug_struct("CycleError")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("channel", &self.channel)
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -41,9 +53,13 @@ impl<K: fmt::Debug> fmt::Display for CycleError<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "adding dependency {:?} -> {:?} in {:?} would create a cycle",
-            self.from, self.to, self.channel
-        )
+            "adding dependency {:?} -> {:?} in {:?} would create a cycle: {:?}",
+            self.from, self.to, self.channel, self.from
+        )?;
+        for key in &self.path {
+            write!(f, " -> {key:?}")?;
+        }
+        Ok(())
     }
 }
 
@@ -258,12 +274,37 @@ where
     ) -> Result<bool, CycleError<K>> {
         match handling {
             CycleHandling::DebugAssert => {
-                debug_assert!(false, "adding dependency would create a cycle");
+                if cfg!(debug_assertions) {
+                    let path = self.cycle_path(from, to, channel);
+                    panic!(
+                        "adding dependency {} -> {} in {channel:?} would create a cycle: {}{} \
+                         (keys shown by DenseKey index); use CycleHandling::Error to handle \
+                         cycles as errors",
+                        from.index(),
+                        to.index(),
+                        from.index(),
+                        IndexPath(&path),
+                    );
+                }
                 Ok(false)
             }
-            CycleHandling::Error => Err(CycleError { from, to, channel }),
+            CycleHandling::Error => Err(CycleError {
+                from,
+                to,
+                channel,
+                path: self.cycle_path(from, to, channel),
+            }),
             CycleHandling::Ignore | CycleHandling::Allow => Ok(false),
         }
+    }
+
+    /// The existing chain from `to` back to `from` that `from -> to` would close.
+    fn cycle_path(&self, from: K, to: K, channel: Channel) -> Vec<K> {
+        if from == to {
+            return alloc::vec![from];
+        }
+        self.dependency_path(to, from, channel)
+            .expect("a cycle was detected, so `to` depends on `from`")
     }
 
     /// Checks whether adding `from -> to` would create a cycle.
@@ -547,6 +588,58 @@ where
         slice.iter().copied()
     }
 
+    /// Returns a shortest chain of dependencies from `from` to `to`, if `from`
+    /// depends on `to` directly or transitively in `channel`.
+    ///
+    /// The chain starts with `from` and ends with `to`, and each key depends on
+    /// the next. It answers "why does `from` depend on `to`?", and, read
+    /// backwards, "why would invalidating `to` invalidate `from`?". A key
+    /// trivially reaches itself: `dependency_path(k, k, ch)` is `Some([k])`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{Channel, CycleHandling, InvalidationGraph};
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    ///
+    /// let mut graph = InvalidationGraph::<u32>::new();
+    /// graph.add_dependency(3, 2, LAYOUT, CycleHandling::Error).unwrap();
+    /// graph.add_dependency(2, 1, LAYOUT, CycleHandling::Error).unwrap();
+    ///
+    /// assert_eq!(graph.dependency_path(3, 1, LAYOUT), Some(vec![3, 2, 1]));
+    /// assert_eq!(graph.dependency_path(1, 3, LAYOUT), None);
+    /// ```
+    #[must_use]
+    pub fn dependency_path(&self, from: K, to: K, channel: Channel) -> Option<Vec<K>> {
+        // Breadth-first over forward edges, remembering how each key was reached.
+        let mut reached_from: HashMap<K, K> = HashMap::new();
+        let mut frontier = alloc::collections::VecDeque::new();
+        frontier.push_back(from);
+        reached_from.insert(from, from);
+
+        while let Some(current) = frontier.pop_front() {
+            if current == to {
+                let mut path = alloc::vec![to];
+                let mut key = to;
+                while key != from {
+                    key = reached_from[&key];
+                    path.push(key);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for dep in self.dependencies(current, channel) {
+                if let hashbrown::hash_map::Entry::Vacant(e) = reached_from.entry(dep) {
+                    e.insert(current);
+                    frontier.push_back(dep);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Returns an iterator over all transitive dependents of `key` in the given channel.
     ///
     /// This performs a DFS traversal and yields all keys that directly or
@@ -729,6 +822,19 @@ where
     }
 }
 
+/// Formats a cycle's continuation as ` -> a -> b` using dense key indices,
+/// for messages about keys that need not implement `Debug`.
+struct IndexPath<'a, K>(&'a [K]);
+
+impl<K: DenseKey> fmt::Display for IndexPath<'_, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for key in self.0 {
+            write!(f, " -> {}", key.index())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1009,11 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.from, 1);
         assert_eq!(err.to, 3);
+        assert_eq!(err.path, vec![3, 2, 1]);
+        assert_eq!(
+            alloc::format!("{err}"),
+            "adding dependency 1 -> 3 in Channel(0) would create a cycle: 1 -> 3 -> 2 -> 1"
+        );
     }
 
     #[test]
@@ -910,7 +1021,39 @@ mod tests {
         let mut graph = InvalidationGraph::<u32>::new();
 
         let result = graph.add_dependency(1, 1, LAYOUT, CycleHandling::Error);
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().path, vec![1]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "adding dependency 1 -> 3 in Channel(0) would create a cycle: 1 -> 3 -> 2 -> 1"
+    )]
+    fn debug_assert_cycle_panic_names_the_cycle() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        graph
+            .add_dependency(3, 2, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        let _ = graph.add_dependency(1, 3, LAYOUT, CycleHandling::DebugAssert);
+    }
+
+    #[test]
+    fn dependency_path_is_shortest_and_channel_scoped() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        // 4 -> 3 -> 2 -> 1, and a shortcut 4 -> 1.
+        for (from, to) in [(4, 3), (3, 2), (2, 1), (4, 1)] {
+            graph
+                .add_dependency(from, to, LAYOUT, CycleHandling::Error)
+                .unwrap();
+        }
+        assert_eq!(graph.dependency_path(4, 1, LAYOUT), Some(vec![4, 1]));
+        assert_eq!(graph.dependency_path(3, 1, LAYOUT), Some(vec![3, 2, 1]));
+        assert_eq!(graph.dependency_path(2, 2, LAYOUT), Some(vec![2]));
+        assert_eq!(graph.dependency_path(1, 4, LAYOUT), None);
+        assert_eq!(graph.dependency_path(4, 1, PAINT), None);
     }
 
     #[test]
