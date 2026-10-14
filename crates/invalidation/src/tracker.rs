@@ -2524,4 +2524,158 @@ mod tests {
             }
         }
     }
+
+    /// Runs random operation sequences and checks that no work is lost.
+    ///
+    /// Every mark obliges the tracker to deliver its closure (the root and
+    /// everything reachable from it through dependencies, cascades, and
+    /// cross-channel edges) through some later drain. Drains here are all
+    /// affected drains, scoped ones keep out-of-scope work, and some are
+    /// abandoned part way. Edges are only added, so an obligation never goes
+    /// away except by being drained.
+    fn run_sequences(cycles: bool, cases: u32) {
+        let mut seed = if cycles { 0xC1C1_u64 } else { 0xACAC_u64 };
+        let mut next = |bound: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            u32::try_from(seed >> 33).unwrap() % bound
+        };
+        let channels = [LAYOUT, PAINT, Channel::new(2)];
+        let handling = if cycles {
+            CycleHandling::Allow
+        } else {
+            CycleHandling::Ignore
+        };
+
+        for case in 0..cases {
+            let n = 2 + next(16);
+            let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(handling);
+            let mut owed = hashbrown::HashSet::<(u32, Channel)>::new();
+            let mut log = Vec::new();
+
+            let drain = |tracker: &mut InvalidationTracker<u32>,
+                         owed: &mut hashbrown::HashSet<(u32, Channel)>,
+                         ch: Channel,
+                         scope: u32,
+                         target: u32,
+                         take: Option<u32>| {
+                let keys: Vec<u32> = (0..n).filter(|k| k % 3 == target % 3).collect();
+                let mut retained = Vec::new();
+                let builder = tracker.drain(ch).affected();
+                let builder = match scope {
+                    0 => builder,
+                    1 => builder
+                        .within_keys(&keys)
+                        .retain_out_of_scope(&mut retained),
+                    _ => builder
+                        .within_dependencies_of(target)
+                        .retain_out_of_scope(&mut retained),
+                };
+                let mut drain = builder.deterministic().run();
+                let mut taken = 0;
+                while take.is_none_or(|limit| taken < limit) {
+                    let Some(key) = drain.next() else { break };
+                    owed.remove(&(key, ch));
+                    taken += 1;
+                }
+            };
+
+            for _ in 0..40 {
+                let ch = channels[next(3) as usize];
+                match next(9) {
+                    0 | 1 => {
+                        let (a, b) = (next(n), next(n));
+                        log.push(alloc::format!("dep {a}->{b} {ch:?}"));
+                        let _ = tracker.add_dependency(a, b, ch).unwrap();
+                    }
+                    2 => {
+                        let (a, b) = (next(3) as usize, next(3) as usize);
+                        if a < b {
+                            log.push(alloc::format!("cascade {a}->{b}"));
+                            let _ = tracker.add_cascade(channels[a], channels[b]);
+                        }
+                    }
+                    3 => {
+                        let (a, b) = (next(n), next(n));
+                        let to = channels[next(3) as usize];
+                        // Like cascades, cross-channel edges that only point
+                        // to later channels cannot form a cycle.
+                        if !cycles && to.index() <= ch.index() {
+                            continue;
+                        }
+                        log.push(alloc::format!("cross ({a},{ch:?})->({b},{to:?})"));
+                        tracker.add_cross_dependency(a, ch, b, to);
+                    }
+                    4 | 5 => {
+                        let key = next(n);
+                        let eager = next(2) == 0;
+                        log.push(alloc::format!("mark {key} {ch:?} eager={eager}"));
+                        owed.insert((key, ch));
+                        owed.extend(tracker.transitive_dependents_cross(key, ch));
+                        if eager {
+                            tracker.mark_with(key, ch, &EagerPolicy);
+                        } else {
+                            tracker.mark_with(key, ch, &LazyPolicy);
+                        }
+                    }
+                    6 => {
+                        let roots: Vec<_> = (0..1 + next(3))
+                            .map(|_| (next(n), channels[next(3) as usize]))
+                            .collect();
+                        log.push(alloc::format!("mark_many {roots:?}"));
+                        for &(key, root_ch) in &roots {
+                            owed.insert((key, root_ch));
+                            owed.extend(tracker.transitive_dependents_cross(key, root_ch));
+                        }
+                        tracker.mark_many_with(roots, &LazyPolicy);
+                    }
+                    _ => {
+                        let (scope, target) = (next(3), next(n));
+                        let take = (next(2) == 0).then(|| next(4));
+                        log.push(alloc::format!(
+                            "drain {ch:?} scope={scope} target={target} take={take:?}"
+                        ));
+                        drain(&mut tracker, &mut owed, ch, scope, target, take);
+                    }
+                }
+            }
+
+            // Flush: drain every channel until nothing is left, or only
+            // keys on cycles are.
+            for _ in 0..8 {
+                for ch in channels {
+                    drain(&mut tracker, &mut owed, ch, 0, 0, None);
+                }
+            }
+
+            for &(key, ch) in &owed {
+                if cycles {
+                    assert!(
+                        tracker.is_invalidated(key, ch),
+                        "case {case}: ({key}, {ch:?}) was neither drained nor kept\n{}",
+                        log.join("\n")
+                    );
+                } else {
+                    panic!(
+                        "case {case}: ({key}, {ch:?}) was never drained\n{}",
+                        log.join("\n")
+                    );
+                }
+            }
+            if !cycles {
+                assert!(tracker.is_clean(), "case {case}: {tracker:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn operation_sequences_lose_no_work() {
+        run_sequences(false, 400);
+    }
+
+    #[test]
+    fn operation_sequences_with_cycles_keep_undrained_work() {
+        run_sequences(true, 400);
+    }
 }
