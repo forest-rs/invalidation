@@ -96,7 +96,9 @@ fn build_reconvergent_tracker(n: u32, reversed: bool) -> InvalidationTracker<u32
     }
     for key in 1..=n {
         let target = if reversed { 2 * n + 1 - key } else { n + key };
-        tracker.add_cross_dependency(key, LAYOUT, target, PAINT);
+        tracker
+            .add_cross_dependency(key, LAYOUT, target, PAINT)
+            .unwrap();
     }
     tracker
 }

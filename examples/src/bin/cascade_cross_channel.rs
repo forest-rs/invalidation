@@ -15,7 +15,7 @@ fn main() {
     tracker.add_cascade(LAYOUT, PAINT).unwrap();
 
     // Different key and channel: node 1's layout output feeds node 2's paint input.
-    tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+    tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 
     tracker.mark_with(1, LAYOUT, &EagerPolicy);
 

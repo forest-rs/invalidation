@@ -35,6 +35,14 @@ This release has an [MSRV][] of 1.88.
   way, against 160 ms with a `mark_with` call per root.
 - Added `PropagationPolicy::marks_only_root` (`true` for `LazyPolicy`) and
   `CrossChannelEdges::source_channels` / `has_sources_in`.
+- `InvalidationTracker` detects cycles that run through channel cascades and
+  cross-channel edges, with its cycle handling, in `add_dependency`,
+  `replace_dependencies`, `add_cross_dependency`, `replace_cross_dependents`,
+  and `add_cascade`. Such a cycle made every affected drain mark work for the
+  next, so a drain-until-clean loop never ended. A channel-level check rules
+  most cycles out cheaply; cross-channel edges that only lead downstream
+  cost almost nothing to check. Added `add_cross_dependency_with`,
+  `CrossCycleError`, and `CrossChannelEdges::channel_pairs`.
 - Added summary queries: `InvalidationSet::channels` (channels with pending
   work), `InvalidationGraph::edges`, `edge_count`, and `channels`, and
   `CrossChannelEdges::edges` and `len`.
@@ -72,10 +80,16 @@ This release has an [MSRV][] of 1.88.
   `DrainedChannels`, which lists the channels whose drain stalled alongside the
   drained keys.
 - Breaking: `CycleError` and `CascadeCycleError` carry the existing chain the
-  rejected edge would close (`path`), and their messages print the whole cycle.
+  rejected edge would close (`path`, as `(key, channel)` pairs for
+  `CycleError`, since a tracker's cycle can cross channels), and their
+  messages print the whole cycle.
   Both are `#[non_exhaustive]`. With the default `CycleHandling::DebugAssert`,
   the debug-build panic now names the keys, channel, and cycle instead of only
   saying that one exists.
+- Breaking: `InvalidationTracker::add_cross_dependency` returns
+  `Result<AddDependency, CrossCycleError>`, and `replace_cross_dependents`
+  returns `Result<DependencyChanges<(K, Channel)>, CrossCycleError>`, since
+  either can now be refused for closing a cycle.
 - Breaking: `add_dependency` (on the graph and the tracker) returns
   `AddDependency`, which tells a new edge from one that already existed and
   from one dropped because it would have created a cycle; all three used to be

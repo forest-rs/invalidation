@@ -41,7 +41,7 @@ use crate::channel::{Channel, ChannelNames, ChannelSet};
 /// let mut tracker = InvalidationTracker::<u32>::new();
 ///
 /// // Node 1's LAYOUT invalidation feeds node 2's PAINT.
-/// tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+/// tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 ///
 /// tracker.mark_with(1, LAYOUT, &EagerPolicy);
 /// assert!(tracker.is_invalidated(1, LAYOUT));
@@ -73,6 +73,38 @@ pub struct CrossChannelEdges<K> {
     /// Number of `(key, channel)` sources in `forward`, per channel, so that
     /// whether a channel has outgoing edges is a constant-time question.
     sources: [u32; 64],
+    /// Number of edges from each channel to each channel.
+    pairs: PairCounts,
+}
+
+/// Edge counts per `(from channel, to channel)` pair, with a generation that
+/// advances whenever a pair gains its first edge or loses its last.
+#[derive(Clone, Debug, Default)]
+struct PairCounts {
+    counts: HashMap<(Channel, Channel), u32>,
+    generation: u64,
+}
+
+impl PairCounts {
+    fn added(&mut self, from: Channel, to: Channel) {
+        let count = self.counts.entry((from, to)).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            self.generation += 1;
+        }
+    }
+
+    fn removed(&mut self, from: Channel, to: Channel) {
+        let count = self
+            .counts
+            .get_mut(&(from, to))
+            .expect("a removed edge was counted");
+        *count -= 1;
+        if *count == 0 {
+            self.counts.remove(&(from, to));
+            self.generation += 1;
+        }
+    }
 }
 
 impl<K> fmt::Debug for CrossChannelEdges<K>
@@ -126,6 +158,7 @@ where
             forward: HashMap::new(),
             reverse: HashMap::new(),
             sources: [0; 64],
+            pairs: PairCounts::default(),
         }
     }
 
@@ -161,6 +194,18 @@ where
         self.sources[channel.index() as usize] > 0
     }
 
+    /// Returns the `(from, to)` channel pairs that at least one edge
+    /// connects, in unspecified order.
+    pub fn channel_pairs(&self) -> impl Iterator<Item = (Channel, Channel)> + '_ {
+        self.pairs.counts.keys().copied()
+    }
+
+    /// A counter that changes whenever [`channel_pairs`](Self::channel_pairs)
+    /// does, so derived channel-level facts can be cached.
+    pub(crate) fn pair_generation(&self) -> u64 {
+        self.pairs.generation
+    }
+
     /// Returns an iterator over every edge, as `(from, to)` pairs of
     /// `(key, channel)`.
     ///
@@ -194,6 +239,7 @@ where
             return false;
         }
         fwd.push(to);
+        self.pairs.added(from_ch, to_ch);
 
         self.reverse.entry(to).or_default().push(from);
         true
@@ -270,6 +316,9 @@ where
             false
         };
 
+        if removed {
+            self.pairs.removed(from_ch, to_ch);
+        }
         if removed
             && let Some(rev) = self.reverse.get_mut(&to)
             && let Some(pos) = rev.iter().position(|e| *e == from)
@@ -294,6 +343,7 @@ where
         self.sources[from_ch.index() as usize] -= 1;
 
         for to in targets {
+            self.pairs.removed(from_ch, to.1);
             if let Some(rev) = self.reverse.get_mut(&to) {
                 if let Some(pos) = rev.iter().position(|e| *e == from) {
                     rev.swap_remove(pos);
@@ -320,6 +370,7 @@ where
             if let Some(fwd) = self.forward.get_mut(&from) {
                 if let Some(pos) = fwd.iter().position(|e| *e == to) {
                     fwd.swap_remove(pos);
+                    self.pairs.removed(from.1, to_ch);
                 }
                 if fwd.is_empty() {
                     self.forward.remove(&from);
@@ -370,6 +421,7 @@ where
             if let Some(targets) = self.forward.remove(fwd_key) {
                 self.sources[fwd_key.1.index() as usize] -= 1;
                 for to in targets {
+                    self.pairs.removed(fwd_key.1, to.1);
                     if let Some(rev) = self.reverse.get_mut(&to) {
                         if let Some(pos) = rev.iter().position(|e| *e == *fwd_key) {
                             rev.swap_remove(pos);
@@ -397,6 +449,7 @@ where
                     if let Some(fwd) = self.forward.get_mut(&from) {
                         if let Some(pos) = fwd.iter().position(|e| *e == *rev_key) {
                             fwd.swap_remove(pos);
+                            self.pairs.removed(from.1, rev_key.1);
                         }
                         if fwd.is_empty() {
                             self.forward.remove(&from);
@@ -545,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn source_channels_track_every_mutation() {
+    fn source_channels_and_pairs_track_every_mutation() {
         let mut seed = 0x50_u64;
         let mut next = |bound: u32| {
             seed = seed
@@ -577,10 +630,20 @@ mod tests {
                 _ => edges.remove_key(a),
             }
             let mut expected = ChannelSet::EMPTY;
-            for ((_, from_ch), _) in edges.edges() {
+            let mut expected_pairs = alloc::vec::Vec::new();
+            for ((_, from_ch), (_, to_ch)) in edges.edges() {
                 expected.insert(from_ch);
+                expected_pairs.push((from_ch.index(), to_ch.index()));
             }
             assert_eq!(edges.source_channels(), expected);
+            expected_pairs.sort_unstable();
+            expected_pairs.dedup();
+            let mut pairs: alloc::vec::Vec<_> = edges
+                .channel_pairs()
+                .map(|(from, to)| (from.index(), to.index()))
+                .collect();
+            pairs.sort_unstable();
+            assert_eq!(pairs, expected_pairs);
         }
     }
 }
