@@ -479,6 +479,9 @@ where
     K: Copy + Eq + Hash + Ord + DenseKey,
 {
     fn drop(&mut self) {
+        if self.remaining == 0 {
+            return;
+        }
         if let Some(owner) = self.owner.take() {
             for &key in &self.keys {
                 if self.in_degree[key.index()] != DENSE_SENTINEL {
