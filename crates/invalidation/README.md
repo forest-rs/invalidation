@@ -43,7 +43,9 @@ assert_eq!(ordered, vec![1, 2, 3]);
 - dependency: `A depends on B` means `B` must be processed before `A`
 - invalidated root: a key you explicitly mark invalidated
 - affected key: an invalidated root or one of its transitive dependents
-- drain: consume invalidated work in dependency order and clear it
+- drain: consume invalidated work in dependency order; a key leaves the
+  invalidated set once a drain yields it, and keys a drain does not yield
+  (it was stopped early, or stalled on a cycle) stay invalidated
 
 ## Choosing The Main API
 
@@ -192,7 +194,8 @@ assert_eq!(affected, vec![stylesheet, button]);
 - `LazyPolicy` and `drain_sorted` are usually the wrong pair.
 - Deterministic dense drains assume a compact key space; use `Interner` when
   keys are sparse or structured.
-- If cycles are allowed, topological drains can stall.
+- If cycles are allowed, topological drains can stall. The stuck keys stay
+  invalidated; `remaining_keys` on the drain names them.
 
 ## Minimum Supported Rust Version (MSRV)
 

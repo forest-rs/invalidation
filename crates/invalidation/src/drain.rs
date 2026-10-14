@@ -20,6 +20,7 @@ use crate::DrainBuilder;
 use crate::channel::Channel;
 use crate::graph::InvalidationGraph;
 use crate::scratch::TraversalScratch;
+use crate::set::InvalidationSet;
 use crate::trace::InvalidationTrace;
 
 /// Trait for keys that can be used as dense `Vec` indices.
@@ -81,6 +82,9 @@ pub enum DrainCompletion {
     /// All reachable keys were yielded.
     Complete,
     /// The drain stalled: some keys remained with non-zero in-degree (cycle).
+    ///
+    /// The keys that could not be yielded are listed by the drain's
+    /// `remaining_keys`, and stay invalidated once the drain is dropped.
     Stalled {
         /// Number of keys that could not be yielded.
         remaining: usize,
@@ -105,6 +109,19 @@ pub enum DrainCompletion {
 /// - Time complexity: O(V + E) where V is the number of invalidated keys and E is
 ///   the number of edges between them.
 /// - Space complexity: O(V) for the in-degree map and queue.
+///
+/// # Keys Not Yielded
+///
+/// A drain takes its keys out of the invalidation set when it is created, and
+/// owns them until it yields them. When the drain is dropped, every key it
+/// has not yielded is marked invalidated again in its channel: a drain stopped
+/// early (for example because processing a key failed) or stalled on a cycle
+/// leaves that work pending rather than losing it. Use
+/// [`remaining_keys`](Self::remaining_keys) to see which keys those are, and
+/// clear the channel afterwards if the work should be discarded.
+///
+/// Drains created by [`InvalidationTracker::peek_sorted`](crate::InvalidationTracker::peek_sorted)
+/// never took their keys, so they put nothing back.
 ///
 /// # Important Notes
 ///
@@ -154,6 +171,8 @@ where
     /// Remaining in-degree for each invalidated key (within the invalidated subset).
     in_degree: HashMap<K, usize>,
     stalled: bool,
+    /// The set that keys not yet yielded return to on drop; `None` for peeks.
+    owner: Option<&'a mut InvalidationSet<K>>,
 }
 
 /// Deterministic variant of [`DrainSorted`].
@@ -163,6 +182,9 @@ where
 ///
 /// Uses a dense `Vec<u32>` indexed by [`DenseKey::index`] instead of a
 /// `HashMap` for in-degree tracking, eliminating all hashing from the hot path.
+///
+/// Like [`DrainSorted`], it marks the keys it has not yielded invalidated
+/// again when it is dropped.
 #[derive(Debug)]
 pub struct DrainSortedDeterministic<'a, K>
 where
@@ -177,7 +199,12 @@ where
     in_degree: Vec<u32>,
     /// Number of keys remaining (replaces `HashMap::len()`).
     remaining: usize,
+    /// Every key the drain took; those whose in-degree is not the sentinel are
+    /// not yielded yet.
+    keys: Vec<K>,
     stalled: bool,
+    /// The set that keys not yet yielded return to on drop; `None` for peeks.
+    owner: Option<&'a mut InvalidationSet<K>>,
 }
 
 impl<'a, K> DrainSorted<'a, K>
@@ -227,7 +254,14 @@ where
             queue,
             in_degree,
             stalled: false,
+            owner: None,
         }
+    }
+
+    /// Makes the drain return the keys it has not yielded to `owner` on drop.
+    pub(crate) fn returning_to(mut self, owner: &'a mut InvalidationSet<K>) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Returns `true` if there are no more keys to yield.
@@ -244,6 +278,16 @@ where
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.in_degree.len()
+    }
+
+    /// Returns the keys this drain has not yielded, in unspecified order.
+    ///
+    /// After a stall these are the keys on or behind a cycle. They are marked
+    /// invalidated again when the drain is dropped, unless it is a peek,
+    /// which never took them.
+    #[must_use]
+    pub fn remaining_keys(&self) -> Vec<K> {
+        self.in_degree.keys().copied().collect()
     }
 
     /// Returns `true` if the drain has stalled due to a cycle.
@@ -328,7 +372,7 @@ where
 
         // Initialize ready set with zero in-degree keys.
         let mut ready = BinaryHeap::with_capacity(remaining);
-        for key in unique_keys {
+        for &key in &unique_keys {
             if in_degree[key.index()] == 0 {
                 ready.push(Reverse(key));
             }
@@ -340,8 +384,33 @@ where
             ready,
             in_degree,
             remaining,
+            keys: unique_keys,
             stalled: false,
+            owner: None,
         }
+    }
+
+    /// Makes the drain return the keys it has not yielded to `owner` on drop.
+    pub(crate) fn returning_to(mut self, owner: &'a mut InvalidationSet<K>) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Returns the keys this drain has not yielded, in ascending order.
+    ///
+    /// After a stall these are the keys on or behind a cycle. They are marked
+    /// invalidated again when the drain is dropped, unless it is a peek,
+    /// which never took them.
+    #[must_use]
+    pub fn remaining_keys(&self) -> Vec<K> {
+        let mut keys: Vec<K> = self
+            .keys
+            .iter()
+            .copied()
+            .filter(|key| self.in_degree[key.index()] != DENSE_SENTINEL)
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     /// Returns `true` if there are no more keys to yield.
@@ -389,6 +458,34 @@ where
         out.extend(&mut self);
         let completion = self.completion();
         (out, completion)
+    }
+}
+
+impl<K> Drop for DrainSorted<'_, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            for &key in self.in_degree.keys() {
+                owner.mark(key, self.channel);
+            }
+        }
+    }
+}
+
+impl<K> Drop for DrainSortedDeterministic<'_, K>
+where
+    K: Copy + Eq + Hash + Ord + DenseKey,
+{
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            for &key in &self.keys {
+                if self.in_degree[key.index()] != DENSE_SENTINEL {
+                    owner.mark(key, self.channel);
+                }
+            }
+        }
     }
 }
 
@@ -465,9 +562,10 @@ where
 
 /// Creates a topologically sorted drain from a invalidation set.
 ///
-/// This is a convenience function that collects the invalidated keys from a
-/// [`InvalidationSet`](crate::InvalidationSet), clears the channel, and returns a
-/// [`DrainSorted`] iterator.
+/// This is a convenience function that takes the invalidated keys out of an
+/// [`InvalidationSet`], and returns a [`DrainSorted`] iterator over them. The
+/// iterator borrows the set: keys it does not yield are marked invalidated
+/// again when it is dropped.
 ///
 /// See [`DrainSorted`] for notes on cycles and nondeterministic ordering.
 ///
@@ -495,7 +593,7 @@ where
 /// assert!(!invalidated.has_invalidated(LAYOUT));
 /// ```
 pub fn drain_sorted<'a, K>(
-    invalidated: &mut crate::InvalidationSet<K>,
+    invalidated: &'a mut InvalidationSet<K>,
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
 ) -> DrainSorted<'a, K>
@@ -512,7 +610,7 @@ where
 /// This is equivalent to [`drain_sorted`], but when multiple keys are ready
 /// simultaneously it yields them in ascending key order (`Ord`).
 pub fn drain_sorted_deterministic<'a, K>(
-    invalidated: &mut crate::InvalidationSet<K>,
+    invalidated: &'a mut InvalidationSet<K>,
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
 ) -> DrainSortedDeterministic<'a, K>
@@ -567,7 +665,7 @@ where
 /// assert!(!invalidated.has_invalidated(LAYOUT));
 /// ```
 pub fn drain_affected_sorted<'a, K>(
-    invalidated: &mut crate::InvalidationSet<K>,
+    invalidated: &'a mut InvalidationSet<K>,
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
 ) -> DrainSorted<'a, K>
@@ -584,13 +682,13 @@ where
 /// This is a lazy-friendly explainability helper: it records one plausible
 /// cause edge for each affected key **during** the drain-time expansion step.
 ///
-/// Like [`drain_affected_sorted`], this clears the channel and returns a drain
-/// over: roots ∪ transitive dependents.
+/// Like [`drain_affected_sorted`], this takes the channel's keys and returns a
+/// drain over: roots ∪ transitive dependents.
 ///
 /// The trace is best-effort: when a key is reachable from multiple roots or via
 /// multiple paths, this records the first path discovered by the traversal.
 pub fn drain_affected_sorted_with_trace<'a, K, T>(
-    invalidated: &mut crate::InvalidationSet<K>,
+    invalidated: &'a mut InvalidationSet<K>,
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
     scratch: &mut TraversalScratch<K>,
@@ -612,7 +710,7 @@ where
 /// This is equivalent to [`drain_affected_sorted`], but when multiple keys are
 /// ready simultaneously it yields them in ascending key order (`Ord`).
 pub fn drain_affected_sorted_deterministic<'a, K>(
-    invalidated: &mut crate::InvalidationSet<K>,
+    invalidated: &'a mut InvalidationSet<K>,
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
 ) -> DrainSortedDeterministic<'a, K>
@@ -853,6 +951,123 @@ mod tests {
             drain_sorted(&mut invalidated, &graph, LAYOUT).collect_with_completion();
         assert!(sorted.is_empty());
         assert_eq!(completion, DrainCompletion::Stalled { remaining: 3 });
+        assert_eq!(
+            invalidated.len(LAYOUT),
+            3,
+            "keys a stalled drain could not yield stay invalidated"
+        );
+    }
+
+    /// 1 <- 2 <- 3, plus a cycle 4 <-> 5 hanging off 3.
+    fn graph_with_cycle_behind_chain() -> InvalidationGraph<u32> {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        graph
+            .add_dependency(3, 2, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        graph
+            .add_dependency(4, 3, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        graph
+            .add_dependency(4, 5, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        graph
+            .add_dependency(5, 4, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        graph
+    }
+
+    #[test]
+    fn stalled_drain_names_the_keys_it_could_not_yield() {
+        let graph = graph_with_cycle_behind_chain();
+        let mut invalidated = InvalidationSet::new();
+        for key in 1..=5 {
+            invalidated.mark(key, LAYOUT);
+        }
+
+        let mut drain = drain_sorted_deterministic(&mut invalidated, &graph, LAYOUT);
+        let yielded: Vec<_> = drain.by_ref().collect();
+        assert_eq!(yielded, vec![1, 2, 3]);
+        assert_eq!(
+            drain.completion(),
+            DrainCompletion::Stalled { remaining: 2 }
+        );
+        assert_eq!(drain.remaining_keys(), vec![4, 5]);
+        drop(drain);
+
+        let mut left: Vec<_> = invalidated.iter(LAYOUT).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![4, 5], "stalled keys stay invalidated");
+    }
+
+    #[test]
+    fn stalled_unordered_drain_names_the_keys_it_could_not_yield() {
+        let graph = graph_with_cycle_behind_chain();
+        let mut invalidated = InvalidationSet::new();
+        for key in 1..=5 {
+            invalidated.mark(key, LAYOUT);
+        }
+
+        let mut drain = drain_sorted(&mut invalidated, &graph, LAYOUT);
+        assert_eq!(drain.by_ref().count(), 3);
+        let mut remaining = drain.remaining_keys();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![4, 5]);
+        drop(drain);
+
+        assert!(invalidated.is_invalidated(4, LAYOUT));
+        assert!(invalidated.is_invalidated(5, LAYOUT));
+        assert!(!invalidated.is_invalidated(1, LAYOUT));
+    }
+
+    #[test]
+    fn drain_stopped_early_keeps_unyielded_keys_invalidated() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        graph
+            .add_dependency(3, 2, LAYOUT, CycleHandling::Error)
+            .unwrap();
+
+        let mut invalidated = InvalidationSet::new();
+        for key in 1..=3 {
+            invalidated.mark(key, LAYOUT);
+        }
+        let first = drain_sorted(&mut invalidated, &graph, LAYOUT).next();
+        assert_eq!(first, Some(1));
+        assert!(!invalidated.is_invalidated(1, LAYOUT), "yielded keys leave");
+        assert!(invalidated.is_invalidated(2, LAYOUT));
+        assert!(invalidated.is_invalidated(3, LAYOUT));
+
+        let first = drain_sorted_deterministic(&mut invalidated, &graph, LAYOUT).next();
+        assert_eq!(first, Some(2));
+        assert!(!invalidated.is_invalidated(2, LAYOUT));
+        assert!(invalidated.is_invalidated(3, LAYOUT));
+    }
+
+    #[test]
+    fn affected_drain_stopped_early_keeps_expanded_dependents_invalidated() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        graph
+            .add_dependency(3, 2, LAYOUT, CycleHandling::Error)
+            .unwrap();
+
+        // Only the root is marked, as with `LazyPolicy`.
+        let mut invalidated = InvalidationSet::new();
+        invalidated.mark(1, LAYOUT);
+        let first = drain_affected_sorted(&mut invalidated, &graph, LAYOUT).next();
+        assert_eq!(first, Some(1));
+
+        // The drain took responsibility for 2 and 3; they are pending now.
+        let mut left: Vec<_> = invalidated.iter(LAYOUT).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![2, 3]);
     }
 
     #[test]

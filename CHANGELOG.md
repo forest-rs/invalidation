@@ -23,6 +23,21 @@ This release has an [MSRV][] of 1.88.
   drained key lost its pending work. With this option the drain marks each such
   direct dependent invalidated and reports the `(dependent, drained key)` edges
   so callers can attach causes. The default behavior is unchanged.
+- Added `remaining_keys` to `DrainSorted` and `DrainSortedDeterministic`,
+  naming the keys a drain has not yielded, such as those behind a cycle after a
+  stall.
+
+### Changed
+
+- Breaking: a drain no longer loses the keys it does not yield. Keys still
+  leave the invalidated set when a drain is created, but when the drain is
+  dropped every key it has not yielded is marked invalidated again, so a drain
+  stopped early or stalled on a cycle leaves that work pending. The drain
+  iterators therefore borrow the `InvalidationSet` (and the free drain
+  functions take it for as long as the drain lives). Peeks are unaffected.
+- Breaking: `InvalidationTracker::drain_channels_sorted` returns
+  `DrainedChannels`, which lists the channels whose drain stalled alongside the
+  drained keys.
 
 ## [0.2.0][] (2026-04-25)
 
