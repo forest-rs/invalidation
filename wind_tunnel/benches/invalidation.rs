@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Criterion benchmarks for invalidation propagation and drain behavior.
-#![expect(
-    missing_docs,
-    reason = "criterion macros generate the public bench entrypoints"
-)]
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use invalidation::{
     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, InvalidationTracker,
     LazyPolicy, TraversalScratch, drain_sorted,
