@@ -6,8 +6,10 @@
 use alloc::vec::Vec;
 use core::hash::Hash;
 
-use hashbrown::HashMap;
+use core::fmt;
+
 use hashbrown::hash_map::Entry;
+use hashbrown::{HashMap, HashSet};
 
 use crate::channel::{Channel, ChannelSet};
 use crate::drain::DenseKey;
@@ -233,6 +235,127 @@ where
     }
 }
 
+/// A set of keys, for traversals whose size is not known up front.
+///
+/// Keys live in a bitset indexed by [`DenseKey::index`] while it stays within
+/// the bytes [`table_budget`] allows for the keys present (32 bits per table
+/// slot); other keys live in a hash set. The bitset grows as keys arrive, and
+/// hashed keys it then covers move into it, so every key is in exactly one of
+/// the two.
+#[derive(Clone)]
+pub(crate) struct KeySet<K> {
+    bits: Vec<u64>,
+    hashed: HashSet<K>,
+    /// The smallest index in `hashed`, so that growing the bitset looks for
+    /// keys to move only once it reaches one.
+    min_hashed: usize,
+    len: usize,
+}
+
+impl<K> Default for KeySet<K> {
+    fn default() -> Self {
+        Self {
+            bits: Vec::new(),
+            hashed: HashSet::new(),
+            min_hashed: usize::MAX,
+            len: 0,
+        }
+    }
+}
+
+impl<K> fmt::Debug for KeySet<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeySet")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K> KeySet<K> {
+    /// Removes every key, keeping the allocated capacity.
+    pub(crate) fn clear(&mut self) {
+        self.bits.fill(0);
+        self.hashed.clear();
+        self.min_hashed = usize::MAX;
+        self.len = 0;
+    }
+}
+
+impl<K> KeySet<K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    /// Adds `key`, returning `true` if it was absent.
+    pub(crate) fn insert(&mut self, key: K) -> bool {
+        let idx = key.index();
+        if idx / 64 >= self.bits.len() && !self.hashed.contains(&key) {
+            self.grow_for(idx);
+        }
+        let inserted = match self.bits.get_mut(idx / 64) {
+            Some(word) => {
+                let bit = 1 << (idx % 64);
+                let absent = *word & bit == 0;
+                *word |= bit;
+                absent
+            }
+            None => {
+                self.min_hashed = self.min_hashed.min(idx);
+                self.hashed.insert(key)
+            }
+        };
+        self.len += usize::from(inserted);
+        inserted
+    }
+
+    /// Returns `true` if `key` is present.
+    pub(crate) fn contains(&self, key: K) -> bool {
+        let idx = key.index();
+        match self.bits.get(idx / 64) {
+            Some(word) => word & (1 << (idx % 64)) != 0,
+            None => self.hashed.contains(&key),
+        }
+    }
+
+    /// Grows the bitset to cover `idx` if it stays within budget, moving
+    /// hashed keys that it then covers into it.
+    fn grow_for(&mut self, idx: usize) {
+        let budget_words = table_budget(self.len + 1) / 2;
+        let word = idx / 64;
+        if word >= budget_words {
+            return;
+        }
+        let new_len = (word + 1)
+            .max(self.bits.len().saturating_mul(2))
+            .min(budget_words);
+        self.bits.resize(new_len, 0);
+        if self.min_hashed / 64 >= new_len {
+            return;
+        }
+        let bits = &mut self.bits;
+        let mut min_hashed = usize::MAX;
+        self.hashed.retain(|key| {
+            let idx = key.index();
+            match bits.get_mut(idx / 64) {
+                Some(word) => {
+                    *word |= 1 << (idx % 64);
+                    false
+                }
+                None => {
+                    min_hashed = min_hashed.min(idx);
+                    true
+                }
+            }
+        });
+        self.min_hashed = min_hashed;
+    }
+
+    /// Returns the bytes of the bitset, for tests of memory use.
+    #[cfg(test)]
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.bits.len() * 8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +449,41 @@ mod tests {
         assert!(pairs.contains(1000, B) && !pairs.contains(1000, A));
         assert!(pairs.contains(1 << 30, A));
         assert!(pairs.table_slots() <= table_budget(1001));
+    }
+
+    #[test]
+    fn key_set_compact_and_sparse() {
+        let mut keys = KeySet::<u32>::default();
+        for key in (0..5000).rev() {
+            assert!(keys.insert(key));
+        }
+        assert!(!keys.insert(4999));
+        assert!(keys.contains(0) && keys.contains(4999) && !keys.contains(5000));
+        assert!(keys.hashed.is_empty(), "compact keys all fit the bitset");
+        assert!(keys.table_bytes() <= table_budget(5000) * 4);
+
+        let mut sparse = KeySet::<u32>::default();
+        for key in 0..100 {
+            assert!(sparse.insert(key * 10_000_000));
+        }
+        assert_eq!(sparse.len, 100);
+        assert!(sparse.contains(990_000_000));
+        assert!(sparse.table_bytes() <= table_budget(100) * 4);
+
+        keys.clear();
+        assert!(!keys.contains(10));
+        assert!(keys.insert(10));
+
+        // Growth that does not reach the hashed keys does not look at them.
+        let mut mixed = KeySet::<u32>::default();
+        for key in 0..2000 {
+            mixed.insert((1 << 30) + key);
+        }
+        for key in 0..20_000 {
+            mixed.insert(key);
+        }
+        assert_eq!(mixed.hashed.len(), 2000);
+        assert_eq!(mixed.min_hashed, 1 << 30);
+        assert!(mixed.contains(19_999) && mixed.contains((1 << 30) + 1999));
     }
 }

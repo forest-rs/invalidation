@@ -32,12 +32,12 @@
 use alloc::vec::Vec;
 use core::hash::Hash;
 
-use hashbrown::HashSet;
+use crate::adaptive::KeySet;
 
 /// Reusable scratch storage for graph traversals.
 ///
 /// This is useful in tight loops (many marks per frame) to avoid allocating
-/// temporary `Vec`/`HashSet` state on every traversal.
+/// temporary state on every traversal.
 ///
 /// The scratch buffers retain capacity across calls. Callers should reuse a
 /// single scratch instance per thread / update pass.
@@ -54,7 +54,7 @@ where
     K: Copy + Eq + Hash,
 {
     pub(crate) stack: Vec<K>,
-    pub(crate) visited: HashSet<K>,
+    pub(crate) visited: KeySet<K>,
 }
 
 impl<K> TraversalScratch<K>
@@ -66,19 +66,19 @@ where
     pub fn new() -> Self {
         Self {
             stack: Vec::new(),
-            visited: HashSet::new(),
+            visited: KeySet::default(),
         }
     }
 
     /// Creates an empty scratch buffer with pre-allocated capacity.
     ///
-    /// `capacity` is a best-effort hint for both the internal stack and the
-    /// visited set.
+    /// `capacity` is a best-effort hint for the internal stack; the visited
+    /// set grows with the traversal.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             stack: Vec::with_capacity(capacity),
-            visited: HashSet::with_capacity(capacity),
+            visited: KeySet::default(),
         }
     }
 

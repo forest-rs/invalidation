@@ -9,6 +9,7 @@ use core::hash::Hash;
 
 use hashbrown::{HashMap, HashSet};
 
+use crate::adaptive::KeySet;
 use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::drain::{DenseKey, prepare_dense_growth};
 use crate::scratch::TraversalScratch;
@@ -368,7 +369,7 @@ where
     fn would_create_cycle(&self, from: K, to: K, channel: Channel) -> bool {
         // A cycle would be created if `from` is reachable from `to`
         // (i.e., `to` already transitively depends on `from`)
-        let mut visited = HashSet::new();
+        let mut visited = KeySet::default();
         let mut stack = Vec::new();
         stack.push(to);
 
@@ -896,7 +897,7 @@ where
 {
     graph: &'a InvalidationGraph<K>,
     channel: Channel,
-    visited: HashSet<K>,
+    visited: KeySet<K>,
     stack: Vec<K>,
 }
 
@@ -908,7 +909,7 @@ where
         let mut iter = Self {
             graph,
             channel,
-            visited: HashSet::new(),
+            visited: KeySet::default(),
             stack: Vec::new(),
         };
         // Initialize with direct dependents
