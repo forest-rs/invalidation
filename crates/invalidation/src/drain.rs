@@ -520,8 +520,9 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.in_degree.len();
-        (remaining, Some(remaining))
+        // Ready keys will all be yielded; blocked keys may never be, if they
+        // sit on or behind a cycle.
+        (self.queue.len(), Some(self.in_degree.len()))
     }
 }
 
@@ -556,7 +557,9 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        // Ready keys will all be yielded; blocked keys may never be, if they
+        // sit on or behind a cycle.
+        (self.ready.len(), Some(self.remaining))
     }
 }
 
@@ -855,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn size_hint_accurate() {
+    fn size_hint_bounds() {
         let mut graph = InvalidationGraph::<u32>::new();
         graph
             .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
@@ -866,7 +869,8 @@ mod tests {
         let mut drain =
             DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT);
 
-        assert_eq!(drain.size_hint(), (2, Some(2)));
+        // Only 1 is ready; 2 waits on it.
+        assert_eq!(drain.size_hint(), (1, Some(2)));
         assert_eq!(drain.remaining(), 2);
 
         let _ = drain.next();
@@ -1187,5 +1191,39 @@ mod tests {
             rec.explain_path(3, LAYOUT).unwrap(),
             vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)]
         );
+    }
+
+    #[test]
+    fn size_hint_lower_bound_holds_on_cycles() {
+        let graph = graph_with_cycle_behind_chain();
+        let mut invalidated = InvalidationSet::new();
+        for key in 1..=5 {
+            invalidated.mark(key, LAYOUT);
+        }
+
+        // The lower bound must never exceed what is actually yielded.
+        let mut drain = drain_sorted(&mut invalidated, &graph, LAYOUT);
+        loop {
+            let (lower, upper) = drain.size_hint();
+            let rest = drain.remaining();
+            assert_eq!(upper, Some(rest));
+            match drain.next() {
+                Some(_) => assert!(lower <= rest),
+                None => {
+                    assert_eq!(lower, 0, "nothing is ready when the drain stops");
+                    break;
+                }
+            }
+        }
+        drop(drain);
+
+        let mut drain = drain_sorted_deterministic(&mut invalidated, &graph, LAYOUT);
+        assert_eq!(
+            drain.size_hint(),
+            (0, Some(2)),
+            "only 4 and 5 are left, both blocked"
+        );
+        assert_eq!(drain.next(), None);
+        assert_eq!(drain.by_ref().count(), 0);
     }
 }
