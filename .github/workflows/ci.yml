@@ -3,7 +3,7 @@ env:
   # version like 1.70. Note that we only specify MAJOR.MINOR and not PATCH so that bugfixes still
   # come automatically. If the version specified here is no longer the latest stable version,
   # then please feel free to submit a PR that adjusts it along with the potential clippy fixes.
-  RUST_STABLE_VER: "1.94" # In quotes because otherwise (e.g.) 1.70 would be interpreted as 1.7
+  RUST_STABLE_VER: "1.99" # In quotes because otherwise (e.g.) 1.70 would be interpreted as 1.7
   # The purpose of checking with the minimum supported Rust toolchain is to detect its staleness.
   # If the compilation fails, then the version specified here needs to be bumped up to reality.
   # Be sure to also update the rust-version property in the workspace Cargo.toml file,
@@ -72,7 +72,7 @@ jobs:
     name: formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -84,9 +84,9 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Install Taplo
-        uses: uncenter/setup-taplo@09968a8ae38d66ddd3d23802c44bf6122d7aa991 # v1
+        uses: uncenter/setup-taplo@b18c8c8302695fe63d6853bc004006215ac52b91 # v2
         with:
-          version: "0.9.3"
+          version: "0.10.0"
 
       - name: Run taplo fmt
         run: taplo fmt --check --diff
@@ -106,7 +106,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -138,7 +138,7 @@ jobs:
     name: cargo clippy (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -170,7 +170,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -197,7 +197,7 @@ jobs:
     name: cargo test (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install stable toolchain
         uses: dtolnay/rust-toolchain@master
@@ -228,7 +228,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install msrv toolchain
         uses: dtolnay/rust-toolchain@master
@@ -256,7 +256,7 @@ jobs:
     name: cargo check (msrv) (wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install msrv toolchain
         uses: dtolnay/rust-toolchain@master
@@ -283,7 +283,7 @@ jobs:
     #       If we get per-platform docs (win/macos/linux/wasm32/..) then doc jobs should match that.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -303,7 +303,7 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: check typos
-        uses: crate-ci/typos@v1.45.1
+        uses: crate-ci/typos@v1.51.1
