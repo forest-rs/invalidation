@@ -133,6 +133,9 @@ This release has an [MSRV][] of 1.88.
   4096-key chain with a cascade took 88 ms and now takes under 0.5 ms. Marks
   and drains in a channel with no cascades or cross-channel edges out of it
   no longer pay for edges elsewhere.
+- A drain scoped with `within_keys` checks the scope in a set built from the
+  slice instead of scanning the slice for every key: an affected drain scoped
+  to 16384 keys takes 0.25 ms instead of 17 ms.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
