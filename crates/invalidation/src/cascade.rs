@@ -17,7 +17,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::channel::{Channel, ChannelSet};
+use crate::channel::{Channel, ChannelNames, ChannelSet};
 
 /// Maximum number of channels supported (64).
 const MAX_CHANNELS: usize = 64;
@@ -112,10 +112,31 @@ pub struct ChannelCascade {
 }
 
 impl fmt::Debug for ChannelCascade {
+    /// Lists the direct cascade targets of each channel that has any.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChannelCascade")
-            .field("direct", &self.direct)
-            .field("transitive", &self.transitive)
+        f.write_str("ChannelCascade ")?;
+        fmt::Debug::fmt(&self.debug_with(&ChannelNames::new()), f)
+    }
+}
+
+/// Formats direct cascades as a map from channel to targets.
+struct CascadeRules<'a> {
+    cascade: &'a ChannelCascade,
+    names: &'a ChannelNames,
+}
+
+impl fmt::Debug for CascadeRules<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(
+                ChannelSet::ALL
+                    .iter()
+                    .map(|channel| (channel, self.cascade.direct_cascades_from(channel)))
+                    .filter(|(_, targets)| !targets.is_empty())
+                    .map(|(channel, targets)| {
+                        (self.names.display(channel), self.names.set(targets))
+                    }),
+            )
             .finish()
     }
 }
@@ -222,6 +243,14 @@ impl ChannelCascade {
     #[must_use]
     pub fn direct_cascades_from(&self, channel: Channel) -> ChannelSet {
         self.direct[channel.index() as usize]
+    }
+
+    /// Formats the direct cascades, naming channels with `names`.
+    pub(crate) fn debug_with<'a>(&'a self, names: &'a ChannelNames) -> impl fmt::Debug + 'a {
+        CascadeRules {
+            cascade: self,
+            names,
+        }
     }
 
     /// Returns `true` if no cascade rules are configured.

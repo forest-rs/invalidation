@@ -14,11 +14,12 @@
 //! coordinator.
 
 use alloc::vec::Vec;
+use core::fmt;
 use core::hash::Hash;
 
 use hashbrown::HashMap;
 
-use crate::channel::Channel;
+use crate::channel::{Channel, ChannelNames};
 
 /// Sparse cross-channel dependency edges.
 ///
@@ -63,12 +64,43 @@ use crate::channel::Channel;
 /// let deps: Vec<_> = edges.dependents(1, LAYOUT).collect();
 /// assert_eq!(deps, vec![(2, PAINT)]);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrossChannelEdges<K> {
     /// Forward map: `(from_key, from_channel)` → list of `(to_key, to_channel)`.
     forward: HashMap<(K, Channel), Vec<(K, Channel)>>,
     /// Reverse map: `(to_key, to_channel)` → list of `(from_key, from_channel)`.
     reverse: HashMap<(K, Channel), Vec<(K, Channel)>>,
+}
+
+impl<K> fmt::Debug for CrossChannelEdges<K>
+where
+    K: Copy + Eq + Hash + fmt::Debug,
+{
+    /// Lists the edges as `(key, channel) -> (key, channel)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CrossChannelEdges ")?;
+        fmt::Debug::fmt(&self.debug_with(&ChannelNames::new()), f)
+    }
+}
+
+/// Formats cross-channel edges as a list of `(key, channel) -> (key, channel)`.
+struct CrossEdges<'a, K> {
+    edges: &'a CrossChannelEdges<K>,
+    names: &'a ChannelNames,
+}
+
+impl<K> fmt::Debug for CrossEdges<'_, K>
+where
+    K: Copy + Eq + Hash + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = self.names;
+        f.debug_list()
+            .entries(self.edges.edges().map(|((fk, fc), (tk, tc))| {
+                crate::graph::Edge((fk, names.display(fc)), (tk, names.display(tc)))
+            }))
+            .finish()
+    }
 }
 
 impl<K> Default for CrossChannelEdges<K>
@@ -97,6 +129,30 @@ where
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.forward.is_empty()
+    }
+
+    /// Returns the number of cross-channel edges.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.forward.values().map(Vec::len).sum()
+    }
+
+    /// Returns an iterator over every edge, as `(from, to)` pairs of
+    /// `(key, channel)`.
+    ///
+    /// The iteration order is not specified.
+    pub fn edges(&self) -> impl Iterator<Item = ((K, Channel), (K, Channel))> + '_ {
+        self.forward
+            .iter()
+            .flat_map(|(&from, targets)| targets.iter().map(move |&to| (from, to)))
+    }
+
+    /// Formats the edges, naming channels with `names`.
+    pub(crate) fn debug_with<'a>(&'a self, names: &'a ChannelNames) -> impl fmt::Debug + 'a
+    where
+        K: fmt::Debug,
+    {
+        CrossEdges { edges: self, names }
     }
 
     /// Adds a cross-channel edge.

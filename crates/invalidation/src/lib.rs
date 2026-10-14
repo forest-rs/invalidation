@@ -189,7 +189,7 @@ pub mod trace;
 mod tracker;
 
 pub use cascade::{CascadeCycleError, ChannelCascade};
-pub use channel::{Channel, ChannelSet, ChannelSetIter};
+pub use channel::{Channel, ChannelNames, ChannelSet, ChannelSetIter};
 pub use cross_channel::CrossChannelEdges;
 pub use drain::{
     DenseKey, DrainCompletion, DrainSorted, DrainSortedDeterministic, drain_affected_sorted,

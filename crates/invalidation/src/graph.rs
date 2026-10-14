@@ -9,7 +9,7 @@ use core::hash::Hash;
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::channel::{Channel, ChannelSet};
+use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::drain::{DenseKey, prepare_dense_growth};
 use crate::scratch::TraversalScratch;
 
@@ -185,7 +185,7 @@ pub enum CycleHandling {
 ///   set, cascade, and cross-channel workflows.
 /// - [`CycleHandling`]: Cycle policy used by [`add_dependency`](Self::add_dependency).
 /// - [`DrainSorted`](crate::DrainSorted): Drains invalidated keys in dependency order.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InvalidationGraph<K>
 where
     K: Copy + Eq + Hash + DenseKey,
@@ -702,6 +702,57 @@ where
         None
     }
 
+    /// Returns an iterator over every dependency edge in `channel`, as
+    /// `(from, to)` pairs where `from` depends on `to`.
+    ///
+    /// The iteration order is not specified.
+    pub fn edges(&self, channel: Channel) -> impl Iterator<Item = (K, K)> + '_ {
+        let ch = channel.index() as usize;
+        let reverse = &self.reverse[ch];
+        self.forward[ch]
+            .iter()
+            .enumerate()
+            .filter(|(_, deps)| !deps.is_empty())
+            .flat_map(move |(from_idx, deps)| {
+                // Keys cannot be rebuilt from indices; `from` is stored in the
+                // reverse list of any of its dependencies.
+                let from = reverse[deps[0].index()]
+                    .iter()
+                    .copied()
+                    .find(|key| key.index() == from_idx)
+                    .expect("every forward edge has a reverse edge");
+                deps.iter().map(move |&to| (from, to))
+            })
+    }
+
+    /// Returns the number of dependency edges in `channel`.
+    ///
+    /// This walks the channel's adjacency lists, so it costs time proportional
+    /// to the key space; it is meant for diagnostics, not hot paths.
+    #[must_use]
+    pub fn edge_count(&self, channel: Channel) -> usize {
+        self.forward[channel.index() as usize]
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Returns the channels that have at least one dependency edge.
+    #[must_use]
+    pub fn channels(&self) -> ChannelSet {
+        self.forward_channels
+            .iter()
+            .fold(ChannelSet::EMPTY, |all, &channels| all | channels)
+    }
+
+    /// Formats the graph's edges per channel, naming channels with `names`.
+    pub(crate) fn debug_with<'a>(&'a self, names: &'a ChannelNames) -> impl fmt::Debug + 'a
+    where
+        K: fmt::Debug,
+    {
+        GraphEdges { graph: self, names }
+    }
+
     /// Returns an iterator over all transitive dependents of `key` in the given channel.
     ///
     /// This performs a DFS traversal and yields all keys that directly or
@@ -881,6 +932,78 @@ where
             }
         }
         None
+    }
+}
+
+impl<K> fmt::Debug for InvalidationGraph<K>
+where
+    K: Copy + Eq + Hash + DenseKey + fmt::Debug,
+{
+    /// Lists the edges of each channel that has any, as `from -> to`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InvalidationGraph ")?;
+        fmt::Debug::fmt(&self.debug_with(&ChannelNames::new()), f)
+    }
+}
+
+/// Formats a graph as a map from channel to its edges.
+struct GraphEdges<'a, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    graph: &'a InvalidationGraph<K>,
+    names: &'a ChannelNames,
+}
+
+impl<K> fmt::Debug for GraphEdges<'_, K>
+where
+    K: Copy + Eq + Hash + DenseKey + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.graph.channels().iter().map(|channel| {
+                (
+                    self.names.display(channel),
+                    DebugEdges {
+                        graph: self.graph,
+                        channel,
+                    },
+                )
+            }))
+            .finish()
+    }
+}
+
+/// Formats one channel's edges as a list of `from -> to`.
+struct DebugEdges<'a, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    graph: &'a InvalidationGraph<K>,
+    channel: Channel,
+}
+
+impl<K> fmt::Debug for DebugEdges<'_, K>
+where
+    K: Copy + Eq + Hash + DenseKey + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.graph
+                    .edges(self.channel)
+                    .map(|(from, to)| Edge(from, to)),
+            )
+            .finish()
+    }
+}
+
+/// A dependency edge formatted as `from -> to`.
+pub(crate) struct Edge<K>(pub(crate) K, pub(crate) K);
+
+impl<K: fmt::Debug> fmt::Debug for Edge<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?} -> {:?}", self.0, self.1)
     }
 }
 
