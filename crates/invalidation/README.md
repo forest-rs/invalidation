@@ -92,7 +92,9 @@ assert_eq!(ordered, vec![1, 2, 3]);
 Use `mark_with` for normal update workflows. It applies the chosen propagation
 policy, same-key channel cascades, and cross-channel edges until the
 invalidation closure is complete, and returns a `MarkReport` saying how many
-keys became invalidated, and in which channels.
+keys became invalidated, and in which channels. `mark_with_trace` does the same
+while recording why each `(key, channel)` became invalidated, through
+dependencies, cascades, and cross-channel edges.
 
 Use `mark` only when you intentionally want a direct mark without same-channel
 graph traversal or cross-channel edge traversal. It still applies same-key

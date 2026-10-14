@@ -17,7 +17,7 @@ use crate::graph::{
 use crate::policy::PropagationPolicy;
 use crate::scratch::TraversalScratch;
 use crate::set::InvalidationSet;
-use crate::trace::InvalidationTrace;
+use crate::trace::{InvalidationCause, InvalidationTrace};
 
 /// Coordinates graph dependencies, invalidation state, and cross-channel rules.
 ///
@@ -185,7 +185,10 @@ where
     ///
     /// assert_eq!(order, vec![1, 2, 3]);
     /// assert!(tracker.is_invalidated(9, LAYOUT));
-    /// assert_eq!(trace.explain_path(3, LAYOUT).unwrap(), vec![1, 2, 3]);
+    /// assert_eq!(
+    ///     trace.explain_path(3, LAYOUT).unwrap(),
+    ///     vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)]
+    /// );
     /// ```
     pub fn drain(&mut self, channel: Channel) -> DrainBuilder<'_, '_, '_, K, AnyOrder> {
         DrainBuilder::new(&mut self.invalidated, &self.graph, channel)
@@ -509,35 +512,109 @@ where
     where
         P: PropagationPolicy<K>,
     {
+        self.mark_closure(key, channel, policy, None)
+    }
+
+    /// Marks a key like [`mark_with`](Self::mark_with), while reporting each
+    /// `(key, channel)` the closure reaches to `trace`.
+    ///
+    /// Every step of the closure is reported with its cause: the root, a
+    /// same-channel dependency (as reported by the policy's
+    /// [`propagate_with_trace`](PropagationPolicy::propagate_with_trace)), a
+    /// channel cascade, or a cross-channel edge. With a
+    /// [`OneParentRecorder`](crate::OneParentRecorder),
+    /// [`explain_path`](crate::OneParentRecorder::explain_path) then answers
+    /// why any pair is invalidated, across channels. `scratch` is reused for
+    /// the policy's traversals.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{
+    ///     Channel, EagerPolicy, InvalidationCause, InvalidationTracker, OneParentRecorder,
+    ///     TraversalScratch,
+    /// };
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    /// const PAINT: Channel = Channel::new(1);
+    ///
+    /// let mut tracker = InvalidationTracker::<u32>::new();
+    /// tracker.add_cascade(LAYOUT, PAINT).unwrap();
+    ///
+    /// let mut scratch = TraversalScratch::new();
+    /// let mut trace = OneParentRecorder::new();
+    /// tracker.mark_with_trace(1, LAYOUT, &EagerPolicy, &mut scratch, &mut trace);
+    ///
+    /// assert_eq!(
+    ///     trace.cause(1, PAINT),
+    ///     Some(InvalidationCause::Cascade { channel: LAYOUT })
+    /// );
+    /// ```
+    pub fn mark_with_trace<P, T>(
+        &mut self,
+        key: K,
+        channel: Channel,
+        policy: &P,
+        scratch: &mut TraversalScratch<K>,
+        trace: &mut T,
+    ) -> MarkReport
+    where
+        P: PropagationPolicy<K>,
+        T: InvalidationTrace<K>,
+    {
+        self.mark_closure(key, channel, policy, Some((scratch, trace)))
+    }
+
+    /// The closure behind [`mark_with`](Self::mark_with) and
+    /// [`mark_with_trace`](Self::mark_with_trace).
+    fn mark_closure<P>(
+        &mut self,
+        key: K,
+        channel: Channel,
+        policy: &P,
+        mut tracing: Option<(&mut TraversalScratch<K>, &mut dyn InvalidationTrace<K>)>,
+    ) -> MarkReport
+    where
+        P: PropagationPolicy<K>,
+    {
         let mut report = MarkReport::default();
 
         // Fast path: no cascades, no cross-channel edges — pure single-channel.
         if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
             report.record(&mut self.invalidated, channel, |set| {
-                policy.propagate(key, channel, &self.graph, set);
+                run_policy(
+                    policy,
+                    key,
+                    channel,
+                    InvalidationCause::Root,
+                    &self.graph,
+                    set,
+                    tracing.as_mut(),
+                );
             });
             return report;
         }
 
         // Slow path: unified closure across channels.
         //
-        // Worklist of (key, channel) pairs to propagate. For each pair we:
+        // Worklist of (key, channel) pairs to propagate, with the cause that
+        // reached them. For each pair we:
         // 1. Run the policy (same-channel propagation).
         // 2. For each key that ended up invalidated on that channel
         //    (root + dependents), check cascades and cross-channel edges.
         // 3. Enqueue any new (key, channel) pairs discovered.
-        let mut worklist: Vec<(K, Channel)> = Vec::new();
-        worklist.push((key, channel));
+        let mut worklist: Vec<(K, Channel, InvalidationCause<K>)> = Vec::new();
+        worklist.push((key, channel, InvalidationCause::Root));
         let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
 
-        while let Some((k, ch)) = worklist.pop() {
+        while let Some((k, ch, cause)) = worklist.pop() {
             if !processed.insert((k, ch)) {
                 continue;
             }
 
             // 1. Run the propagation policy on this (key, channel).
             report.record(&mut self.invalidated, ch, |set| {
-                policy.propagate(k, ch, &self.graph, set);
+                run_policy(policy, k, ch, cause, &self.graph, set, tracing.as_mut());
             });
 
             // 2. Discover cross-channel targets from k and all of its
@@ -780,7 +857,7 @@ where
             }
 
             // 2. Cascade and cross-channel successors.
-            self.for_each_cross_successor(k, ch, |next_key, next_ch| {
+            self.for_each_cross_successor(k, ch, |next_key, next_ch, _cause| {
                 if visited.insert((next_key, next_ch)) {
                     result.push((next_key, next_ch));
                     queue.push((next_key, next_ch));
@@ -791,14 +868,24 @@ where
         result
     }
 
-    /// Calls `f` for each cascade or cross-channel successor of `(key, channel)`.
-    fn for_each_cross_successor(&self, key: K, channel: Channel, mut f: impl FnMut(K, Channel)) {
+    /// Calls `f` for each cascade or cross-channel successor of `(key, channel)`,
+    /// with the cause that leads to it.
+    fn for_each_cross_successor(
+        &self,
+        key: K,
+        channel: Channel,
+        mut f: impl FnMut(K, Channel, InvalidationCause<K>),
+    ) {
         for cascade_ch in self.cascade.cascades_from(channel) {
-            f(key, cascade_ch);
+            f(key, cascade_ch, InvalidationCause::Cascade { channel });
         }
 
         for (to_key, to_ch) in self.cross_channel.dependents(key, channel) {
-            f(to_key, to_ch);
+            f(
+                to_key,
+                to_ch,
+                InvalidationCause::CrossChannel { key, channel },
+            );
         }
     }
 
@@ -809,13 +896,71 @@ where
         key: K,
         channel: Channel,
         processed: &hashbrown::HashSet<(K, Channel)>,
-        worklist: &mut Vec<(K, Channel)>,
+        worklist: &mut Vec<(K, Channel, InvalidationCause<K>)>,
     ) {
-        self.for_each_cross_successor(key, channel, |to_key, to_ch| {
+        self.for_each_cross_successor(key, channel, |to_key, to_ch, cause| {
             if !processed.contains(&(to_key, to_ch)) {
-                worklist.push((to_key, to_ch));
+                worklist.push((to_key, to_ch, cause));
             }
         });
+    }
+}
+
+/// Runs `policy` on `(key, channel)`, reporting to the trace when there is one.
+///
+/// The policy reports `key` as a root; `cause` is what actually reached it in
+/// the tracker's closure (a cascade or a cross-channel edge, for steps after
+/// the first).
+fn run_policy<K, P>(
+    policy: &P,
+    key: K,
+    channel: Channel,
+    cause: InvalidationCause<K>,
+    graph: &InvalidationGraph<K>,
+    invalidated: &mut InvalidationSet<K>,
+    tracing: Option<&mut (&mut TraversalScratch<K>, &mut dyn InvalidationTrace<K>)>,
+) where
+    K: Copy + Eq + Hash + DenseKey,
+    P: PropagationPolicy<K>,
+{
+    match tracing {
+        None => policy.propagate(key, channel, graph, invalidated),
+        Some((scratch, trace)) => {
+            let mut step = StepTrace {
+                inner: &mut **trace,
+                key,
+                channel,
+                cause,
+            };
+            policy.propagate_with_trace(key, channel, graph, invalidated, scratch, &mut step);
+        }
+    }
+}
+
+/// Reports one step of the tracker's closure, replacing the policy's `Root`
+/// for the step's own key with the cause that reached it.
+struct StepTrace<'a, K> {
+    inner: &'a mut dyn InvalidationTrace<K>,
+    key: K,
+    channel: Channel,
+    cause: InvalidationCause<K>,
+}
+
+impl<K: Copy + Eq> InvalidationTrace<K> for StepTrace<'_, K> {
+    fn record(
+        &mut self,
+        key: K,
+        channel: Channel,
+        cause: InvalidationCause<K>,
+        newly_invalidated: bool,
+    ) {
+        let cause =
+            if cause == InvalidationCause::Root && key == self.key && channel == self.channel {
+                self.cause
+            } else {
+                cause
+            };
+        self.inner.record(key, channel, cause, newly_invalidated);
     }
 }
 
@@ -1635,5 +1780,110 @@ mod tests {
         let mut expected = ChannelSet::from(LAYOUT);
         expected.insert(PAINT);
         assert_eq!(report.channels, expected);
+    }
+
+    #[test]
+    fn mark_with_trace_explains_cascades_and_cross_channel_edges() {
+        use crate::trace::{InvalidationCause, OneParentRecorder};
+
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+
+        let mut scratch = TraversalScratch::new();
+        let mut trace = OneParentRecorder::new();
+        let report = tracker.mark_with_trace(1, LAYOUT, &EagerPolicy, &mut scratch, &mut trace);
+
+        // Tracing does not change what is marked.
+        assert_eq!(report.newly_invalidated, 6);
+        assert_eq!(trace.len(), 6, "every marked pair has a cause");
+        assert_eq!(trace.cause(1, LAYOUT), Some(InvalidationCause::Root));
+        assert_eq!(
+            trace.cause(2, LAYOUT),
+            Some(InvalidationCause::Dependency { key: 1 })
+        );
+        assert_eq!(
+            trace.cause(9, LAYOUT),
+            Some(InvalidationCause::CrossChannel {
+                key: 2,
+                channel: PAINT
+            })
+        );
+        assert_eq!(
+            trace.explain_path(9, PAINT),
+            Some(vec![
+                (1, LAYOUT),
+                (2, LAYOUT),
+                (2, PAINT),
+                (9, LAYOUT),
+                (9, PAINT)
+            ])
+        );
+    }
+
+    #[test]
+    fn mark_with_trace_matches_mark_with() {
+        use crate::trace::OneParentRecorder;
+
+        let build = || {
+            let mut tracker = InvalidationTracker::<u32>::new();
+            tracker.add_dependency(2, 1, LAYOUT).unwrap();
+            tracker.add_dependency(3, 2, PAINT).unwrap();
+            tracker.add_cascade(LAYOUT, PAINT).unwrap();
+            tracker.add_cross_dependency(3, PAINT, 1, Channel::new(2));
+            tracker
+        };
+        for lazy in [false, true] {
+            let mut plain = build();
+            let mut traced = build();
+            let mut scratch = TraversalScratch::new();
+            let mut trace = OneParentRecorder::new();
+            let (a, b) = if lazy {
+                (
+                    plain.mark_with(2, LAYOUT, &LazyPolicy),
+                    traced.mark_with_trace(2, LAYOUT, &LazyPolicy, &mut scratch, &mut trace),
+                )
+            } else {
+                (
+                    plain.mark_with(2, LAYOUT, &EagerPolicy),
+                    traced.mark_with_trace(2, LAYOUT, &EagerPolicy, &mut scratch, &mut trace),
+                )
+            };
+            assert_eq!(a, b);
+            for ch in [LAYOUT, PAINT, Channel::new(2)] {
+                let mut x: Vec<_> = plain.invalidated().iter(ch).collect();
+                let mut y: Vec<_> = traced.invalidated().iter(ch).collect();
+                x.sort_unstable();
+                y.sort_unstable();
+                assert_eq!(x, y, "lazy: {lazy}, channel {ch:?}");
+                for key in y {
+                    assert!(trace.explain_path(key, ch).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_policy_trace_defaults_to_reporting_the_root() {
+        use crate::trace::{InvalidationCause, OneParentRecorder};
+
+        let mut tracker = InvalidationTracker::<u32>::new();
+        let mut scratch = TraversalScratch::new();
+        let mut trace = OneParentRecorder::new();
+        tracker.mark_with_trace(
+            1,
+            LAYOUT,
+            &OffGraphMarkPolicy { extra_key: 5 },
+            &mut scratch,
+            &mut trace,
+        );
+        assert_eq!(trace.cause(1, LAYOUT), Some(InvalidationCause::Root));
+        assert_eq!(
+            trace.cause(5, LAYOUT),
+            None,
+            "the default reports the root only"
+        );
+        assert!(tracker.is_invalidated(5, LAYOUT));
     }
 }

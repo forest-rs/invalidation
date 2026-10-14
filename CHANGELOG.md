@@ -26,6 +26,9 @@ This release has an [MSRV][] of 1.88.
 - Added `remaining_keys` to `DrainSorted` and `DrainSortedDeterministic`,
   naming the keys a drain has not yielded, such as those behind a cycle after a
   stall.
+- Added `InvalidationTracker::mark_with_trace`, which records why each
+  `(key, channel)` in the closure became invalidated: the root, a dependency, a
+  channel cascade, or a cross-channel edge.
 - Added `InvalidationGraph::dependency_path`, a shortest chain of dependencies
   between two keys, answering "why does this key depend on that one?".
 
@@ -54,6 +57,13 @@ This release has an [MSRV][] of 1.88.
   `(key, channel)` pairs it newly invalidated and the channels they are in, so
   a caller can tell a no-op from a change without comparing the set before and
   after.
+- Breaking: traces now explain invalidation across channels.
+  `InvalidationCause` has `Root`, `Dependency`, `Cascade`, and `CrossChannel`
+  variants (`Because` became `Dependency`) and is `#[non_exhaustive]`;
+  `InvalidationTrace` has a single `record` method taking the cause; and
+  `OneParentRecorder::explain_path` returns `(key, channel)` pairs.
+  `EagerPolicy::propagate_with_trace` moved to the `PropagationPolicy` trait,
+  whose default reports only the root.
 
 ## [0.2.0][] (2026-04-25)
 

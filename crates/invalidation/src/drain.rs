@@ -1183,6 +1183,9 @@ mod tests {
         .collect();
 
         assert_eq!(sorted, vec![1, 2, 3]);
-        assert_eq!(rec.explain_path(3, LAYOUT).unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            rec.explain_path(3, LAYOUT).unwrap(),
+            vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)]
+        );
     }
 }
