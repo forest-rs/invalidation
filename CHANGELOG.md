@@ -42,6 +42,13 @@ This release has an [MSRV][] of 1.88.
 
 ### Fixed
 
+- With `LazyPolicy`, work that crossed channels was lost: a tracker's affected
+  drain expanded dependents in its own channel only, so with layout cascading
+  to paint, a relaid-out dependent was never repainted, and a cross-channel
+  edge from it was never followed. A tracker's affected drain now follows the
+  cascades and cross-channel edges of every key it takes, and of the keys
+  `retain_out_of_scope` keeps, marking their targets in their channels as
+  roots.
 - The sorted drains' `size_hint` claimed every remaining key as a lower bound,
   but keys on or behind a cycle are never yielded; with a two-key cycle a drain
   promised at least two items and yielded none. The lower bound is now the

@@ -36,6 +36,8 @@ use crate::DrainSortedDeterministic;
 use crate::InvalidationGraph;
 use crate::InvalidationSet;
 use crate::TraversalScratch;
+use crate::cascade::ChannelCascade;
+use crate::cross_channel::CrossChannelEdges;
 use crate::trace::{InvalidationCause, InvalidationTrace};
 
 /// Type-level marker for “any” drain ordering (ties are not specified).
@@ -57,6 +59,80 @@ enum Within<'w, K> {
     All,
     Keys(&'w [K]),
     DependenciesOf(K),
+}
+
+/// A tracker's cascade and cross-channel rules, so that work an affected
+/// drain discovers in its channel reaches the channels that depend on it.
+pub(crate) struct CrossRules<'a, K> {
+    pub(crate) cascade: &'a ChannelCascade,
+    pub(crate) edges: &'a CrossChannelEdges<K>,
+}
+
+impl<K> Clone for CrossRules<'_, K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K> Copy for CrossRules<'_, K> {}
+
+impl<K> CrossRules<'_, K>
+where
+    K: Copy + Eq + Hash,
+{
+    /// Marks the cascade and cross-channel successors of each `(key, channel)`
+    /// in `newly`, and theirs, transitively.
+    ///
+    /// Successors in `channel` that this drain is about to yield are skipped:
+    /// the drain does that work itself.
+    fn follow(
+        self,
+        invalidated: &mut InvalidationSet<K>,
+        channel: Channel,
+        newly: impl IntoIterator<Item = K>,
+        drained: &[K],
+        mut trace: Option<&mut dyn InvalidationTrace<K>>,
+    ) {
+        let mut work: Vec<(K, Channel, InvalidationCause<K>)> = Vec::new();
+        let push_successors = |work: &mut Vec<_>, key: K, ch: Channel| {
+            for to in self.cascade.cascades_from(ch) {
+                work.push((key, to, InvalidationCause::Cascade { channel: ch }));
+            }
+            for (to_key, to_ch) in self.edges.dependents(key, ch) {
+                work.push((
+                    to_key,
+                    to_ch,
+                    InvalidationCause::CrossChannel { key, channel: ch },
+                ));
+            }
+        };
+        for key in newly {
+            push_successors(&mut work, key, channel);
+        }
+        if work.is_empty() {
+            return;
+        }
+
+        let mut drained_set: Option<HashSet<K>> = None;
+        let mut seen: HashSet<(K, Channel)> = HashSet::new();
+        while let Some((key, ch, cause)) = work.pop() {
+            if !seen.insert((key, ch)) {
+                continue;
+            }
+            if ch == channel
+                && drained_set
+                    .get_or_insert_with(|| drained.iter().copied().collect())
+                    .contains(&key)
+            {
+                continue;
+            }
+            let newly_invalidated = invalidated.mark(key, ch);
+            if let Some(t) = trace.as_deref_mut() {
+                t.record(key, ch, cause, newly_invalidated);
+            }
+            push_successors(&mut work, key, ch);
+        }
+    }
 }
 
 /// A builder that configures and performs a drain.
@@ -82,6 +158,7 @@ where
     mode: DrainMode,
     within: Within<'d, K>,
     out_of_scope: Option<&'d mut Vec<(K, K)>>,
+    rules: Option<CrossRules<'d, K>>,
     scratch: Option<&'s mut TraversalScratch<K>>,
     trace: Option<&'s mut dyn InvalidationTrace<K>>,
     _order: PhantomData<O>,
@@ -116,10 +193,22 @@ where
             mode: DrainMode::InvalidatedOnly,
             within: Within::All,
             out_of_scope: None,
+            rules: None,
             scratch: None,
             trace: None,
             _order: PhantomData,
         }
+    }
+}
+
+impl<'d, 'g, K> DrainBuilder<'d, 'g, 'd, K, AnyOrder>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    /// Applies a tracker's cross-channel rules to keys an affected drain expands.
+    pub(crate) fn with_rules(mut self, rules: CrossRules<'d, K>) -> Self {
+        self.rules = Some(rules);
+        self
     }
 }
 
@@ -142,6 +231,17 @@ where
     ///
     /// This is the “lazy at mark-time, eager at drain-time” workflow, intended
     /// for use with [`LazyPolicy`](crate::LazyPolicy).
+    ///
+    /// In a drain made by
+    /// [`InvalidationTracker::drain`](crate::InvalidationTracker::drain), the
+    /// drain also passes work on to other channels: for every key it takes,
+    /// the keys its channel cascades and cross-channel edges lead to are
+    /// marked invalidated in their channels, and theirs in turn,
+    /// transitively. They are marked as roots, the way
+    /// [`LazyPolicy`](crate::LazyPolicy) marks: their dependents in those
+    /// channels are not marked, so drain those channels with an affected
+    /// drain too. Drain a channel before the channels it cascades or feeds
+    /// into, so that work it passes on is drained in the same pass.
     #[must_use]
     pub fn affected(mut self) -> Self {
         self.mode = DrainMode::Affected;
@@ -190,7 +290,9 @@ where
     /// explain the retained work from its real root. With
     /// [`deterministic`](DrainBuilder::deterministic) the appended pairs are
     /// sorted by `(dependent, drained key)`; otherwise their order is
-    /// unspecified.
+    /// unspecified. Pairs already in `out_of_scope` are kept. Every edge is
+    /// reported, not one per dependent, so a dependent of several drained
+    /// keys appears once for each.
     ///
     /// This has no effect on untargeted drains, which leave nothing outside
     /// their scope, or on [`invalidated_only`](DrainBuilder::invalidated_only)
@@ -198,13 +300,12 @@ where
     /// idempotent, so keys already invalidated (for example by
     /// [`EagerPolicy`](crate::EagerPolicy)) are simply reported again.
     ///
-    /// Retained keys are marked directly in the invalidated set, without the
-    /// tracker's channel cascades: a key that
-    /// [`InvalidationTracker::mark`](crate::InvalidationTracker::mark) would
-    /// cascade to other channels is marked in this channel only. They are
-    /// also not reported to a [`trace`](DrainBuilder::trace) recorder; the
-    /// pairs appended to `out_of_scope` are the only record of why they were
-    /// retained.
+    /// Retained keys are not reported to a [`trace`](DrainBuilder::trace)
+    /// recorder as retained; the pairs appended to `out_of_scope` are the
+    /// record of why they were. In a drain made by
+    /// [`InvalidationTracker::drain`](crate::InvalidationTracker::drain), their
+    /// cascades and cross-channel edges are followed, as for the keys the
+    /// drain takes (see [`affected`](DrainBuilder::affected)).
     #[must_use]
     pub fn retain_out_of_scope(mut self, out_of_scope: &'d mut Vec<(K, K)>) -> Self {
         self.out_of_scope = Some(out_of_scope);
@@ -231,6 +332,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             trace,
             ..
         } = self;
@@ -241,6 +343,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             scratch: Some(scratch),
             trace: trace.map(|trace| trace as &'s2 mut dyn InvalidationTrace<K>),
             _order: PhantomData,
@@ -271,6 +374,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             ..
         } = self;
         DrainBuilder {
@@ -280,6 +384,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             scratch: Some(scratch),
             trace: Some(trace),
             _order: PhantomData,
@@ -304,6 +409,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             scratch,
             trace,
             ..
@@ -315,6 +421,7 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             scratch,
             trace,
             _order: PhantomData,
@@ -513,15 +620,23 @@ where
     }
 }
 
-impl<'d, 'g: 'd, 's, K> DrainBuilder<'d, 'g, 's, K, AnyOrder>
+impl<'d, 'g: 'd, 's, K, O> DrainBuilder<'d, 'g, 's, K, O>
 where
     K: Copy + Eq + Hash + DenseKey,
 {
-    /// Executes the drain and returns an iterator in topological order.
+    /// Takes this drain's keys out of the invalidated set, expanding and
+    /// retaining as configured, and passes work found for other channels on.
     ///
-    /// The iterator borrows the invalidated set: keys it does not yield are
-    /// marked invalidated again when it is dropped. See [`DrainSorted`].
-    pub fn run(self) -> DrainSorted<'d, K> {
+    /// Returns the keys to drain, with the set and graph the drain needs.
+    fn take_keys(
+        self,
+        order_retained: impl FnOnce(&mut [(K, K)]),
+    ) -> (
+        Vec<K>,
+        &'d mut InvalidationSet<K>,
+        &'g InvalidationGraph<K>,
+        Channel,
+    ) {
         let DrainBuilder {
             invalidated,
             graph,
@@ -529,8 +644,9 @@ where
             mode,
             within,
             out_of_scope,
+            rules,
             mut scratch,
-            trace,
+            mut trace,
             ..
         } = self;
 
@@ -549,10 +665,20 @@ where
         let keys = match mode {
             DrainMode::InvalidatedOnly => roots,
             DrainMode::Affected => {
-                let keys =
-                    Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace);
+                let keys = Self::collect_affected(
+                    graph,
+                    channel,
+                    roots,
+                    &within,
+                    allowed,
+                    scratch,
+                    trace
+                        .as_deref_mut()
+                        .map(|t| t as &mut dyn InvalidationTrace<K>),
+                );
+                let mut retained: &[(K, K)] = &[];
                 if let Some(out) = out_of_scope {
-                    let _ = Self::retain_out_of_scope_dependents(
+                    let start = Self::retain_out_of_scope_dependents(
                         invalidated,
                         graph,
                         channel,
@@ -561,11 +687,37 @@ where
                         &keys,
                         out,
                     );
+                    order_retained(&mut out[start..]);
+                    retained = &out[start..];
+                }
+                if let Some(rules) = rules {
+                    let retained = retained.iter().map(|&(dependent, _)| dependent);
+                    rules.follow(
+                        invalidated,
+                        channel,
+                        keys.iter().copied().chain(retained),
+                        &keys,
+                        trace.map(|t| t as &mut dyn InvalidationTrace<K>),
+                    );
                 }
                 keys
             }
         };
 
+        (keys, invalidated, graph, channel)
+    }
+}
+
+impl<'d, 'g: 'd, 's, K> DrainBuilder<'d, 'g, 's, K, AnyOrder>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    /// Executes the drain and returns an iterator in topological order.
+    ///
+    /// The iterator borrows the invalidated set: keys it does not yield are
+    /// marked invalidated again when it is dropped. See [`DrainSorted`].
+    pub fn run(self) -> DrainSorted<'d, K> {
+        let (keys, invalidated, graph, channel) = self.take_keys(|_| {});
         let cap = keys.len();
         DrainSorted::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
             .returning_to(invalidated)
@@ -581,51 +733,8 @@ where
     /// The iterator borrows the invalidated set: keys it does not yield are
     /// marked invalidated again when it is dropped. See [`DrainSorted`].
     pub fn run(self) -> DrainSortedDeterministic<'d, K> {
-        let DrainBuilder {
-            invalidated,
-            graph,
-            channel,
-            mode,
-            within,
-            out_of_scope,
-            mut scratch,
-            trace,
-            ..
-        } = self;
-
-        let allowed_set_storage;
-        let allowed = match within {
-            Within::DependenciesOf(key) => {
-                allowed_set_storage =
-                    Self::compute_allowed_dependencies(graph, channel, key, scratch.as_deref_mut());
-                Some(&allowed_set_storage)
-            }
-            Within::All | Within::Keys(_) => None,
-        };
-
-        let roots = Self::take_roots(invalidated, channel, &within, allowed);
-
-        let keys = match mode {
-            DrainMode::InvalidatedOnly => roots,
-            DrainMode::Affected => {
-                let keys =
-                    Self::collect_affected(graph, channel, roots, &within, allowed, scratch, trace);
-                if let Some(out) = out_of_scope {
-                    let start = Self::retain_out_of_scope_dependents(
-                        invalidated,
-                        graph,
-                        channel,
-                        &within,
-                        allowed,
-                        &keys,
-                        out,
-                    );
-                    out[start..].sort_unstable();
-                }
-                keys
-            }
-        };
-
+        let (keys, invalidated, graph, channel) =
+            self.take_keys(|retained| retained.sort_unstable());
         let cap = keys.len();
         DrainSortedDeterministic::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
             .returning_to(invalidated)

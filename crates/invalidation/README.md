@@ -64,7 +64,10 @@ Two workflows are intentionally first-class:
 
 - `EagerPolicy`: propagate immediately at mark time, then use `drain_sorted`.
 - `LazyPolicy`: mark only roots at change time, then expand with
-  `drain_affected_sorted` or `DrainBuilder::affected`.
+  `drain_affected_sorted` or `DrainBuilder::affected`. A tracker's affected
+  drain also follows the cascades and cross-channel edges of the keys it
+  drains, marking their targets as roots, so drain a channel before the
+  channels it feeds, and drain those with affected drains too.
 
 ```rust
 use invalidation::{Channel, EagerPolicy, InvalidationTracker, LazyPolicy};

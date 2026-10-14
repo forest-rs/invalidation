@@ -11,7 +11,7 @@ use crate::cascade::{CascadeCycleError, ChannelCascade};
 use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
-use crate::drain_builder::{AnyOrder, DrainBuilder};
+use crate::drain_builder::{AnyOrder, CrossRules, DrainBuilder};
 use crate::graph::{
     AddDependency, CycleError, CycleHandling, DependencyChanges, InvalidationGraph,
 };
@@ -223,7 +223,14 @@ where
     /// );
     /// ```
     pub fn drain(&mut self, channel: Channel) -> DrainBuilder<'_, '_, '_, K, AnyOrder> {
-        DrainBuilder::new(&mut self.invalidated, &self.graph, channel)
+        let builder = DrainBuilder::new(&mut self.invalidated, &self.graph, channel);
+        if self.cascade.is_empty() && self.cross_channel.is_empty() {
+            return builder;
+        }
+        builder.with_rules(CrossRules {
+            cascade: &self.cascade,
+            edges: &self.cross_channel,
+        })
     }
 
     /// Creates a new empty invalidation tracker with default cycle handling.
@@ -2167,5 +2174,136 @@ mod tests {
         // does not re-run on keys an earlier step covered.
         assert!(report.keys_scanned < 2 * n as usize, "{report:?}");
         assert!(report.policy_runs <= 2, "{report:?}");
+    }
+
+    #[test]
+    fn lazy_affected_drain_passes_work_to_cascaded_channels() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+        let layout: Vec<_> = tracker
+            .drain_affected_sorted_deterministic(LAYOUT)
+            .collect();
+        assert_eq!(layout, vec![1, 2]);
+        let paint: Vec<_> = tracker.drain_affected_sorted_deterministic(PAINT).collect();
+        assert_eq!(paint, vec![1, 2], "relaying out 2 repaints it");
+        assert!(tracker.is_clean());
+    }
+
+    #[test]
+    fn lazy_affected_drain_follows_cross_channel_edges_transitively() {
+        const A11Y: Channel = Channel::new(2);
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        tracker.add_cascade(PAINT, A11Y).unwrap();
+
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+        let _ = tracker.drain_affected_sorted(LAYOUT).count();
+        assert!(tracker.is_invalidated(9, PAINT));
+        assert!(
+            tracker.is_invalidated(9, A11Y),
+            "the target's cascades follow too"
+        );
+        assert!(!tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn affected_drain_follows_edges_of_keys_it_did_not_expand() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        // A direct mark follows no cross-channel edges, and this edge did not
+        // exist when 2 was marked; the drain follows it anyway.
+        tracker.mark(2, LAYOUT);
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        let _ = tracker.drain_affected_sorted(LAYOUT).count();
+        assert!(tracker.is_invalidated(9, PAINT));
+    }
+
+    #[test]
+    fn work_passed_on_by_a_drain_is_marked_as_roots() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        tracker.add_dependency(10, 9, PAINT).unwrap();
+        tracker.mark(1, LAYOUT);
+        let _ = tracker.drain_affected_sorted(LAYOUT).count();
+
+        assert!(tracker.is_invalidated(9, PAINT));
+        assert!(
+            !tracker.is_invalidated(10, PAINT),
+            "a root, not its dependents"
+        );
+        let paint: Vec<_> = tracker.drain_affected_sorted_deterministic(PAINT).collect();
+        assert_eq!(paint, vec![9, 10], "an affected drain expands it");
+    }
+
+    #[test]
+    fn affected_drain_does_not_requeue_same_channel_keys_it_drains() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 1, LAYOUT).unwrap();
+        // A same-channel cross edge into a key this drain yields anyway.
+        tracker.add_cross_dependency(2, LAYOUT, 3, LAYOUT);
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let drained: Vec<_> = tracker
+            .drain_affected_sorted_deterministic(LAYOUT)
+            .collect();
+        assert_eq!(drained, vec![1, 2, 3]);
+        assert!(tracker.is_clean(), "3 was drained, not left pending");
+    }
+
+    #[test]
+    fn retained_out_of_scope_keys_follow_cascades() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let mut retained = Vec::new();
+        let drained: Vec<_> = tracker
+            .drain(LAYOUT)
+            .affected()
+            .within_dependencies_of(2)
+            .retain_out_of_scope(&mut retained)
+            .deterministic()
+            .run()
+            .collect();
+        assert_eq!(drained, vec![1, 2]);
+        assert_eq!(retained, vec![(3, 1)]);
+        assert!(tracker.is_invalidated(3, LAYOUT));
+        assert!(
+            tracker.is_invalidated(3, PAINT),
+            "the retained key repaints too"
+        );
+        assert!(tracker.is_invalidated(2, PAINT));
+    }
+
+    #[test]
+    fn affected_drain_traces_work_passed_to_other_channels() {
+        use crate::trace::{InvalidationCause, OneParentRecorder};
+
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let mut scratch = TraversalScratch::new();
+        let mut trace = OneParentRecorder::new();
+        let _ = tracker
+            .drain_affected_sorted_with_trace(LAYOUT, &mut scratch, &mut trace)
+            .count();
+        assert_eq!(
+            trace.cause(2, PAINT),
+            Some(InvalidationCause::Cascade { channel: LAYOUT })
+        );
+        assert_eq!(
+            trace.explain_path(2, PAINT),
+            Some(vec![(1, LAYOUT), (2, LAYOUT), (2, PAINT)])
+        );
     }
 }
