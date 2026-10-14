@@ -114,6 +114,15 @@ pub struct MarkReport {
     pub newly_invalidated: usize,
     /// The channels in which at least one key became invalidated.
     pub channels: ChannelSet,
+    /// How many times the propagation policy ran: once per `(key, channel)`
+    /// pair the closure reached. `1` when no cascade or cross-channel edge
+    /// was followed.
+    pub policy_runs: usize,
+    /// How many keys the closure visited, after running the policy, while
+    /// looking for cascades and cross-channel edges to follow. `0` on the
+    /// single-channel fast path. This is the closure's own traversal work;
+    /// the policy's traversals are not counted.
+    pub keys_scanned: usize,
 }
 
 impl MarkReport {
@@ -630,6 +639,7 @@ where
 
         // Fast path: no cascades, no cross-channel edges — pure single-channel.
         if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
+            report.policy_runs = 1;
             report.record(&mut self.invalidated, channel, |set| {
                 run_policy(
                     policy,
@@ -662,6 +672,7 @@ where
             }
 
             // 1. Run the propagation policy on this (key, channel).
+            report.policy_runs += 1;
             report.record(&mut self.invalidated, ch, |set| {
                 run_policy(policy, k, ch, cause, &self.graph, set, tracing.as_mut());
             });
@@ -673,6 +684,7 @@ where
             // Enqueue targets for each transitive dependent of k on ch
             // that was actually marked (eager marks them, lazy does not).
             for dep in self.graph.transitive_dependents(k, ch) {
+                report.keys_scanned += 1;
                 if self.invalidated.is_invalidated(dep, ch) {
                     self.enqueue_cross_successors(dep, ch, &processed, &mut worklist);
                 }
@@ -1983,5 +1995,22 @@ mod tests {
             alloc::format!("{:?}", tracker.graph()),
             "InvalidationGraph {Channel(0): [2 -> 1]}"
         );
+    }
+
+    #[test]
+    fn mark_report_counts_closure_work() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 2, LAYOUT).unwrap();
+        let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        assert_eq!(report.policy_runs, 1);
+        assert_eq!(report.keys_scanned, 0, "the fast path does not scan");
+
+        tracker.clear_all();
+        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
+        let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        // (1, LAYOUT) and (1, PAINT); the layout step scans 2 and 3.
+        assert_eq!(report.policy_runs, 2);
+        assert_eq!(report.keys_scanned, 2);
     }
 }
