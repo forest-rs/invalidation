@@ -34,7 +34,7 @@
 //! let mut tracker = InvalidationTracker::<u32>::new();
 //! tracker.add_dependency(2, 1, LAYOUT).unwrap();
 //! tracker.add_cascade(LAYOUT, PAINT).unwrap();
-//! tracker.add_cross_dependency(2, PAINT, 7, LAYOUT);
+//! tracker.add_cross_dependency(2, PAINT, 7, LAYOUT).unwrap();
 //!
 //! let mut scratch = TraversalScratch::new();
 //! let mut trace = OneParentRecorder::new();

@@ -123,7 +123,7 @@ let mut tracker = InvalidationTracker::<u32>::new();
 tracker.add_cascade(LAYOUT, PAINT).unwrap();
 
 // Different key and channel: node 1 layout feeds node 2 paint.
-tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 
 tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -201,7 +201,9 @@ assert_eq!(affected, vec![stylesheet, button]);
 - Deterministic dense drains assume a compact key space; use `Interner` when
   keys are sparse or structured.
 - If cycles are allowed, topological drains can stall. The stuck keys stay
-  invalidated; `remaining_keys` on the drain names them.
+  invalidated; `remaining_keys` on the drain names them. The tracker also
+  rejects cycles through cascades and cross-channel edges, which would make
+  each affected drain mark work for the next.
 
 ## Minimum Supported Rust Version (MSRV)
 

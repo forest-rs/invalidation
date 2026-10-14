@@ -21,7 +21,9 @@ const MAX_CHANNELS: usize = 64;
 ///
 /// The error carries the existing chain of dependencies that the new edge
 /// would close, so the cycle can be reported and broken without searching the
-/// graph again.
+/// graph again. In an [`InvalidationGraph`] the chain stays in one channel; in
+/// an [`InvalidationTracker`](crate::InvalidationTracker) it can run through
+/// channel cascades and cross-channel edges too.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CycleError<K> {
@@ -31,12 +33,15 @@ pub struct CycleError<K> {
     pub to: K,
     /// The channel where the cycle would occur.
     pub channel: Channel,
-    /// The existing dependency chain from `to` back to `from`.
+    /// The existing dependency chain from `(to, channel)` back to
+    /// `(from, channel)`.
     ///
-    /// It starts with `to` and ends with `from`, and each key depends on the
-    /// next one, so `from -> to` followed by this chain is the cycle. For a
-    /// self-dependency (`from == to`) it is just `[from]`.
-    pub path: Vec<K>,
+    /// It starts with `(to, channel)` and ends with `(from, channel)`, and
+    /// each pair depends on the next one, through a dependency in its
+    /// channel, a channel cascade, or a cross-channel edge; so `from -> to`
+    /// followed by this chain is the cycle. For a self-dependency
+    /// (`from == to`) it is just `[(from, channel)]`.
+    pub path: Vec<(K, Channel)>,
 }
 
 impl<K: fmt::Debug> fmt::Debug for CycleError<K> {
@@ -54,11 +59,24 @@ impl<K: fmt::Debug> fmt::Display for CycleError<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "adding dependency {:?} -> {:?} in {:?} would create a cycle: {:?}",
-            self.from, self.to, self.channel, self.from
+            "adding dependency {:?} -> {:?} in {:?} would create a cycle: ",
+            self.from, self.to, self.channel
         )?;
-        for key in &self.path {
-            write!(f, " -> {key:?}")?;
+        // Keys alone while the cycle stays in the channel, pairs otherwise.
+        if self
+            .path
+            .iter()
+            .all(|&(_, channel)| channel == self.channel)
+        {
+            write!(f, "{:?}", self.from)?;
+            for (key, _) in &self.path {
+                write!(f, " -> {key:?}")?;
+            }
+        } else {
+            write!(f, "({:?}, {:?})", self.from, self.channel)?;
+            for (key, channel) in &self.path {
+                write!(f, " -> ({key:?}, {channel:?})")?;
+            }
         }
         Ok(())
     }
@@ -331,7 +349,11 @@ where
         match handling {
             CycleHandling::DebugAssert => {
                 if cfg!(debug_assertions) {
-                    let path = self.cycle_path(from, to, channel);
+                    let path: Vec<K> = self
+                        .cycle_path(from, to, channel)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect();
                     panic!(
                         "adding dependency {} -> {} in {channel:?} would create a cycle: {}{} \
                          (keys shown by DenseKey index); use CycleHandling::Error to handle \
@@ -355,12 +377,15 @@ where
     }
 
     /// The existing chain from `to` back to `from` that `from -> to` would close.
-    fn cycle_path(&self, from: K, to: K, channel: Channel) -> Vec<K> {
+    fn cycle_path(&self, from: K, to: K, channel: Channel) -> Vec<(K, Channel)> {
         if from == to {
-            return alloc::vec![from];
+            return alloc::vec![(from, channel)];
         }
         self.dependency_path(to, from, channel)
             .expect("a cycle was detected, so `to` depends on `from`")
+            .into_iter()
+            .map(|key| (key, channel))
+            .collect()
     }
 
     /// Checks whether adding `from -> to` would create a cycle.
@@ -1199,7 +1224,7 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.from, 1);
         assert_eq!(err.to, 3);
-        assert_eq!(err.path, vec![3, 2, 1]);
+        assert_eq!(err.path, vec![(3, LAYOUT), (2, LAYOUT), (1, LAYOUT)]);
         assert_eq!(
             alloc::format!("{err}"),
             "adding dependency 1 -> 3 in Channel(0) would create a cycle: 1 -> 3 -> 2 -> 1"
@@ -1211,7 +1236,7 @@ mod tests {
         let mut graph = InvalidationGraph::<u32>::new();
 
         let result = graph.add_dependency(1, 1, LAYOUT, CycleHandling::Error);
-        assert_eq!(result.unwrap_err().path, vec![1]);
+        assert_eq!(result.unwrap_err().path, vec![(1, LAYOUT)]);
     }
 
     #[test]

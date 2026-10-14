@@ -33,7 +33,9 @@ fn main() {
     tracker.add_dependency(LABEL, BUTTON, ARRANGE).unwrap();
 
     // Sparse derived relationship: the button anchors a tooltip surface.
-    tracker.add_cross_dependency(BUTTON, ARRANGE, TOOLTIP, SURFACE);
+    tracker
+        .add_cross_dependency(BUTTON, ARRANGE, TOOLTIP, SURFACE)
+        .unwrap();
 
     // A pseudo-class or selector input changed on the button. Lazy marking
     // records phase roots now; affected drains expand same-channel dependents

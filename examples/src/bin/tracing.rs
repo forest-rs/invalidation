@@ -17,7 +17,7 @@ fn main() {
     tracker.add_dependency(2, 1, LAYOUT).unwrap();
     tracker.add_dependency(3, 2, LAYOUT).unwrap();
     tracker.add_cascade(LAYOUT, PAINT).unwrap();
-    tracker.add_cross_dependency(3, PAINT, 7, LAYOUT);
+    tracker.add_cross_dependency(3, PAINT, 7, LAYOUT).unwrap();
 
     let mut scratch = TraversalScratch::new();
     let mut trace = OneParentRecorder::new();

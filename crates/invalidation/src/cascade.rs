@@ -34,7 +34,12 @@ pub struct CascadeCycleError {
     ///
     /// It starts with `to` and ends with `from`, and each channel cascades to
     /// the next, so `from -> to` followed by this chain is the cycle. For a
-    /// self-cascade (`from == to`) it is just `[from]`.
+    /// self-cascade (`from == to`) it is just `[from]`. When
+    /// [`InvalidationTracker::add_cascade`](crate::InvalidationTracker::add_cascade)
+    /// rejects a cascade that would close a cycle through cross-channel
+    /// edges, these are the channels that cycle passes through, and
+    /// invalidation moves from each to the next by a cascade, a dependency,
+    /// or a cross-channel edge.
     pub path: Vec<Channel>,
 }
 

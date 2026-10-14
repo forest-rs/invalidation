@@ -158,6 +158,17 @@
 //! - `Ignore`: Silently ignore the dependency.
 //! - `Allow`: Skip cycle detection entirely.
 //!
+//! An [`InvalidationTracker`] also catches cycles that run through channel
+//! cascades and cross-channel edges, with the same handling: in
+//! [`add_dependency`](InvalidationTracker::add_dependency),
+//! [`add_cross_dependency`](InvalidationTracker::add_cross_dependency) (which
+//! returns [`CrossCycleError`]), and
+//! [`add_cascade`](InvalidationTracker::add_cascade). Such a cycle would make
+//! each affected drain mark work for the next one. A cheap channel-level check
+//! rules most of them out, so cross-channel edges that only lead downstream
+//! cost almost nothing to check. [`ChannelCascade`] and [`CrossChannelEdges`]
+//! used on their own cannot see the rest of the graph, so they do not check.
+//!
 //! ## `no_std` Support
 //!
 //! This crate is `no_std` and uses `alloc`. It does not depend on `std`.
@@ -173,7 +184,9 @@
 //! - Deterministic dense drains assume a compact key space; intern sparse or
 //!   structured keys first.
 //! - If cycles are allowed, topological drains can stall. The stuck keys stay
-//!   invalidated; [`DrainSorted::remaining_keys`] names them.
+//!   invalidated; [`DrainSorted::remaining_keys`] names them. A cycle through
+//!   cross-channel edges does not stall a drain, but each affected drain then
+//!   marks work for the next.
 
 #![no_std]
 
@@ -183,6 +196,7 @@ mod adaptive;
 mod cascade;
 mod channel;
 mod cross_channel;
+mod cycles;
 mod drain;
 mod drain_builder;
 mod graph;
@@ -196,6 +210,7 @@ mod tracker;
 pub use cascade::{CascadeCycleError, ChannelCascade};
 pub use channel::{Channel, ChannelNames, ChannelSet, ChannelSetIter};
 pub use cross_channel::CrossChannelEdges;
+pub use cycles::CrossCycleError;
 pub use drain::{
     DenseKey, DrainCompletion, DrainSorted, DrainSortedDeterministic, drain_affected_sorted,
     drain_affected_sorted_deterministic, drain_affected_sorted_with_trace, drain_sorted,
