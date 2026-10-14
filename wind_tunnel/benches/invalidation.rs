@@ -334,6 +334,26 @@ fn bench_invalidation(c: &mut Criterion) {
 
         group.bench_function(
             format!(
+                "redundant_marks_then_drain_eager_many(n={n},e={edges_per_node},marks={marks},roots={unique_roots})"
+            ),
+            |b| {
+                b.iter_batched(
+                    || build_dag_tracker(n, edges_per_node, 0xD1A7_0000_0000_0010),
+                    |mut tracker| {
+                        let roots = roots_repeating(unique_roots, marks).map(|root| (root, LAYOUT));
+                        black_box(tracker.mark_many_with(roots, &EagerPolicy));
+                        let sum: u64 = tracker
+                            .drain_sorted(LAYOUT)
+                            .fold(0_u64, |acc, k| acc + u64::from(k));
+                        black_box(sum);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_function(
+            format!(
                 "redundant_marks_then_drain_eager_with_scratch(n={n},e={edges_per_node},marks={marks},roots={unique_roots})"
             ),
             |b| {
