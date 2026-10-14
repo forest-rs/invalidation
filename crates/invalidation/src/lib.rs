@@ -193,7 +193,7 @@ pub use drain::{
     drain_sorted_deterministic,
 };
 pub use drain_builder::{AnyOrder, DeterministicOrder, DrainBuilder};
-pub use graph::{CycleError, CycleHandling, InvalidationGraph};
+pub use graph::{AddDependency, CycleError, CycleHandling, DependencyChanges, InvalidationGraph};
 pub use intern::InternId;
 pub use policy::{EagerPolicy, LazyPolicy, PropagationPolicy};
 pub use scratch::TraversalScratch;
