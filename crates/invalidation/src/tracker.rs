@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::hash::Hash;
 
 use crate::cascade::{CascadeCycleError, ChannelCascade};
-use crate::channel::{Channel, ChannelSet};
+use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
 use crate::drain_builder::{AnyOrder, DrainBuilder};
@@ -65,7 +65,7 @@ use crate::trace::{InvalidationCause, InvalidationTrace};
 /// - [`ChannelCascade`] and [`CrossChannelEdges`]: Cross-channel coordination.
 /// - [`EagerPolicy`](crate::EagerPolicy) and [`LazyPolicy`](crate::LazyPolicy): Built-in propagation strategies.
 /// - [`drain_sorted`](crate::drain_sorted) and [`drain_affected_sorted`](crate::drain_affected_sorted): Free-function drain helpers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InvalidationTracker<K>
 where
     K: Copy + Eq + Hash + DenseKey,
@@ -80,6 +80,28 @@ where
     cascade: ChannelCascade,
     /// Cross-channel edges connecting (key, channel) pairs.
     cross_channel: CrossChannelEdges<K>,
+    /// Names for channels in diagnostics.
+    channel_names: ChannelNames,
+}
+
+impl<K> core::fmt::Debug for InvalidationTracker<K>
+where
+    K: Copy + Eq + Hash + DenseKey + core::fmt::Debug,
+{
+    /// Shows the invalidated keys, dependency edges, cascades, and
+    /// cross-channel edges of each channel that has any, with channels named
+    /// by [`channel_names`](Self::channel_names).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let names = &self.channel_names;
+        f.debug_struct("InvalidationTracker")
+            .field("invalidated", &self.invalidated.debug_with(names))
+            .field("generation", &self.invalidated.generation())
+            .field("dependencies", &self.graph.debug_with(names))
+            .field("cascades", &self.cascade.debug_with(names))
+            .field("cross_channel", &self.cross_channel.debug_with(names))
+            .field("cycle_handling", &self.cycle_handling)
+            .finish()
+    }
 }
 
 /// What [`InvalidationTracker::mark_with`] marked.
@@ -209,6 +231,7 @@ where
             cycle_handling,
             cascade: ChannelCascade::new(),
             cross_channel: CrossChannelEdges::new(),
+            channel_names: ChannelNames::new(),
         }
     }
 
@@ -226,6 +249,7 @@ where
             cycle_handling: CycleHandling::default(),
             cascade: ChannelCascade::from_edges(cascades)?,
             cross_channel: CrossChannelEdges::new(),
+            channel_names: ChannelNames::new(),
         })
     }
 
@@ -256,6 +280,7 @@ where
             cycle_handling,
             cascade: ChannelCascade::new(),
             cross_channel: CrossChannelEdges::new(),
+            channel_names: ChannelNames::new(),
         }
     }
 
@@ -280,6 +305,30 @@ where
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.invalidated.generation()
+    }
+
+    /// Names channels in this tracker's `Debug` output.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{Channel, ChannelNames, InvalidationTracker};
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    ///
+    /// let mut tracker = InvalidationTracker::<u32>::new();
+    /// tracker.set_channel_names(ChannelNames::new().with(LAYOUT, "layout"));
+    /// tracker.mark(1, LAYOUT);
+    /// assert!(format!("{tracker:?}").contains("invalidated: {layout: {1}}"));
+    /// ```
+    pub fn set_channel_names(&mut self, names: ChannelNames) {
+        self.channel_names = names;
+    }
+
+    /// Returns the channel names used in `Debug` output.
+    #[must_use]
+    pub fn channel_names(&self) -> &ChannelNames {
+        &self.channel_names
     }
 
     /// Returns the current cycle handling mode.
@@ -1885,5 +1934,54 @@ mod tests {
             "the default reports the root only"
         );
         assert!(tracker.is_invalidated(5, LAYOUT));
+    }
+
+    #[test]
+    fn summaries_describe_the_tracker() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(3, PAINT, 9, LAYOUT);
+        tracker.mark(1, PAINT);
+
+        let graph = tracker.graph();
+        assert_eq!(graph.channels(), ChannelSet::from(LAYOUT));
+        assert_eq!(graph.edge_count(LAYOUT), 2);
+        assert_eq!(graph.edge_count(PAINT), 0);
+        let mut edges: Vec<_> = graph.edges(LAYOUT).collect();
+        edges.sort_unstable();
+        assert_eq!(edges, vec![(2, 1), (3, 1)]);
+
+        assert_eq!(tracker.invalidated().channels(), ChannelSet::from(PAINT));
+        assert_eq!(tracker.cross_channel().len(), 1);
+        assert_eq!(
+            tracker.cross_channel().edges().collect::<Vec<_>>(),
+            vec![((3, PAINT), (9, LAYOUT))]
+        );
+    }
+
+    #[test]
+    fn debug_shows_only_channels_in_use_by_name() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+        tracker.mark(7, PAINT);
+        tracker.set_channel_names(
+            ChannelNames::new()
+                .with(LAYOUT, "layout")
+                .with(PAINT, "paint"),
+        );
+        assert_eq!(
+            alloc::format!("{tracker:?}"),
+            "InvalidationTracker { invalidated: {paint: {7}}, generation: 1, \
+             dependencies: {layout: [2 -> 1]}, cascades: {layout: {paint}}, \
+             cross_channel: [(2, paint) -> (9, layout)], cycle_handling: DebugAssert }"
+        );
+        assert_eq!(
+            alloc::format!("{:?}", tracker.graph()),
+            "InvalidationGraph {Channel(0): [2 -> 1]}"
+        );
     }
 }

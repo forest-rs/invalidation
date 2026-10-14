@@ -3,11 +3,12 @@
 
 //! Invalidation set: accumulated invalidated keys per channel.
 
+use core::fmt;
 use core::hash::Hash;
 
 use hashbrown::HashSet;
 
-use crate::channel::Channel;
+use crate::channel::{Channel, ChannelNames, ChannelSet};
 
 /// Maximum number of channels supported (64).
 const MAX_CHANNELS: usize = 64;
@@ -57,7 +58,6 @@ const MAX_CHANNELS: usize = 64;
 ///   set, cascade, and cross-channel workflows.
 /// - [`drain_sorted`](crate::drain_sorted): Drain a [`InvalidationSet`] in topological order given a graph.
 /// - [`drain_affected_sorted`](crate::drain_affected_sorted): Drain affected keys (roots + dependents), useful with [`LazyPolicy`](crate::LazyPolicy).
-#[derive(Debug)]
 pub struct InvalidationSet<K>
 where
     K: Copy + Eq + Hash,
@@ -135,6 +135,28 @@ where
         self.channels.iter().all(HashSet::is_empty)
     }
 
+    /// Returns the channels that have at least one invalidated key.
+    ///
+    /// This is the set of channels with pending work.
+    #[must_use]
+    pub fn channels(&self) -> ChannelSet {
+        let mut channels = ChannelSet::EMPTY;
+        for channel in ChannelSet::ALL {
+            if self.has_invalidated(channel) {
+                channels.insert(channel);
+            }
+        }
+        channels
+    }
+
+    /// Formats the invalidated keys per channel, naming channels with `names`.
+    pub(crate) fn debug_with<'a>(&'a self, names: &'a ChannelNames) -> impl fmt::Debug + 'a
+    where
+        K: fmt::Debug,
+    {
+        PendingKeys { set: self, names }
+    }
+
     /// Returns the number of invalidated keys in the given channel.
     #[must_use]
     pub fn len(&self, channel: Channel) -> usize {
@@ -195,6 +217,49 @@ where
         if removed {
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+}
+
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "`channels` is shown through `debug_with`, which skips empty channels"
+)]
+impl<K> fmt::Debug for InvalidationSet<K>
+where
+    K: Copy + Eq + Hash + fmt::Debug,
+{
+    /// Shows the generation and the invalidated keys of each channel that has
+    /// any.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InvalidationSet")
+            .field("generation", &self.generation)
+            .field("invalidated", &self.debug_with(&ChannelNames::new()))
+            .finish()
+    }
+}
+
+/// Formats a set's invalidated keys as a map from channel to keys.
+struct PendingKeys<'a, K>
+where
+    K: Copy + Eq + Hash,
+{
+    set: &'a InvalidationSet<K>,
+    names: &'a ChannelNames,
+}
+
+impl<K> fmt::Debug for PendingKeys<'_, K>
+where
+    K: Copy + Eq + Hash + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.set.channels().iter().map(|channel| {
+                (
+                    self.names.display(channel),
+                    &self.set.channels[channel.index() as usize],
+                )
+            }))
+            .finish()
     }
 }
 

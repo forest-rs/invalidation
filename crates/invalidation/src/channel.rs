@@ -241,6 +241,129 @@ impl Iterator for ChannelSetIter {
 
 impl ExactSizeIterator for ChannelSetIter {}
 
+/// Human-readable names for channels, used when formatting diagnostics.
+///
+/// A [`Channel`] is a bare index, so `Debug` output shows `Channel(3)`. Give an
+/// [`InvalidationTracker`](crate::InvalidationTracker) a `ChannelNames` with
+/// [`set_channel_names`](crate::InvalidationTracker::set_channel_names) and its
+/// `Debug` output names the channels instead. Names can be built in a `const`.
+///
+/// # Example
+///
+/// ```
+/// use invalidation::{Channel, ChannelNames};
+///
+/// const LAYOUT: Channel = Channel::new(0);
+/// const PAINT: Channel = Channel::new(1);
+/// const NAMES: ChannelNames = ChannelNames::new().with(LAYOUT, "layout").with(PAINT, "paint");
+///
+/// assert_eq!(NAMES.name(LAYOUT), Some("layout"));
+/// assert_eq!(format!("{}", NAMES.display(PAINT)), "paint");
+/// assert_eq!(format!("{}", NAMES.display(Channel::new(5))), "Channel(5)");
+/// ```
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct ChannelNames {
+    names: [Option<&'static str>; 64],
+}
+
+impl ChannelNames {
+    /// Creates a table with no names.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { names: [None; 64] }
+    }
+
+    /// Returns the table with `channel` named `name`.
+    #[must_use]
+    pub const fn with(mut self, channel: Channel, name: &'static str) -> Self {
+        self.names[channel.0 as usize] = Some(name);
+        self
+    }
+
+    /// Returns the name of `channel`, if it has one.
+    #[must_use]
+    pub const fn name(&self, channel: Channel) -> Option<&'static str> {
+        self.names[channel.0 as usize]
+    }
+
+    /// Returns `true` if no channel has a name.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.names.iter().all(Option::is_none)
+    }
+
+    /// Formats `channel` by its name, or as `Channel(n)` if it has none.
+    #[must_use]
+    pub fn display(&self, channel: Channel) -> impl fmt::Display + fmt::Debug + '_ {
+        Named {
+            names: self,
+            channel,
+        }
+    }
+
+    /// Formats a channel set with these names.
+    pub(crate) fn set(&self, channels: ChannelSet) -> impl fmt::Debug + '_ {
+        NamedSet {
+            names: self,
+            channels,
+        }
+    }
+}
+
+impl Default for ChannelNames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for ChannelNames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(
+                self.names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| name.map(|name| (i, name))),
+            )
+            .finish()
+    }
+}
+
+/// A channel formatted by name.
+struct Named<'a> {
+    names: &'a ChannelNames,
+    channel: Channel,
+}
+
+impl fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.names.name(self.channel) {
+            Some(name) => f.write_str(name),
+            None => fmt::Debug::fmt(&self.channel, f),
+        }
+    }
+}
+
+impl fmt::Debug for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// A channel set formatted by name.
+struct NamedSet<'a> {
+    names: &'a ChannelNames,
+    channels: ChannelSet,
+}
+
+impl fmt::Debug for NamedSet<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set()
+            .entries(self.channels.iter().map(|ch| self.names.display(ch)))
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
