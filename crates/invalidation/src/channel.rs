@@ -176,6 +176,29 @@ impl BitOrAssign for ChannelSet {
     }
 }
 
+impl BitOr<Channel> for ChannelSet {
+    type Output = Self;
+
+    fn bitor(self, rhs: Channel) -> Self::Output {
+        self | rhs.into_set()
+    }
+}
+
+impl BitOrAssign<Channel> for ChannelSet {
+    fn bitor_assign(&mut self, rhs: Channel) {
+        self.insert(rhs);
+    }
+}
+
+/// Combines two channels into a [`ChannelSet`]: `LAYOUT | PAINT`.
+impl BitOr for Channel {
+    type Output = ChannelSet;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.into_set() | rhs
+    }
+}
+
 impl BitAnd for ChannelSet {
     type Output = Self;
 
@@ -441,5 +464,19 @@ mod tests {
         let set = LAYOUT.into_set() | PAINT.into_set() | A11Y.into_set();
         let iter = set.iter();
         assert_eq!(iter.len(), 3);
+    }
+
+    #[test]
+    fn channels_combine_with_bitor() {
+        const LAYOUT: Channel = Channel::new(0);
+        const PAINT: Channel = Channel::new(1);
+        const A11Y: Channel = Channel::new(2);
+
+        let set = LAYOUT | PAINT;
+        assert!(set.contains(LAYOUT) && set.contains(PAINT));
+        let mut more = set | A11Y;
+        assert_eq!(more.len(), 3);
+        more |= Channel::new(9);
+        assert!(more.contains(Channel::new(9)));
     }
 }
