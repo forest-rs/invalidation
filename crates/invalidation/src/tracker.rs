@@ -594,7 +594,42 @@ where
     where
         P: PropagationPolicy<K>,
     {
-        self.mark_closure(key, channel, policy, None)
+        self.mark_closure([(key, channel)], policy, None)
+    }
+
+    /// Marks many roots as one closure, like calling
+    /// [`mark_with`](Self::mark_with) on each.
+    ///
+    /// The roots share one closure, so dependents, cascades, and
+    /// cross-channel edges that several roots reach are walked once rather
+    /// than once per root. With [`EagerPolicy`](crate::EagerPolicy), marking
+    /// a batch of changed keys this way costs the size of their combined
+    /// closure. The returned [`MarkReport`] covers the whole batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{Channel, EagerPolicy, InvalidationTracker};
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    ///
+    /// let mut tracker = InvalidationTracker::<u32>::new();
+    /// tracker.add_dependency(3, 1, LAYOUT).unwrap();
+    /// tracker.add_dependency(3, 2, LAYOUT).unwrap();
+    ///
+    /// let report = tracker.mark_many_with([(1, LAYOUT), (2, LAYOUT)], &EagerPolicy);
+    /// assert_eq!(report.newly_invalidated, 3);
+    /// assert_eq!(report.keys_scanned, 1, "3 is walked once, not once per root");
+    /// ```
+    pub fn mark_many_with<P>(
+        &mut self,
+        roots: impl IntoIterator<Item = (K, Channel)>,
+        policy: &P,
+    ) -> MarkReport
+    where
+        P: PropagationPolicy<K>,
+    {
+        self.mark_closure(roots, policy, None)
     }
 
     /// Marks a key like [`mark_with`](Self::mark_with), while reporting each
@@ -644,15 +679,15 @@ where
         P: PropagationPolicy<K>,
         T: InvalidationTrace<K>,
     {
-        self.mark_closure(key, channel, policy, Some((scratch, trace)))
+        self.mark_closure([(key, channel)], policy, Some((scratch, trace)))
     }
 
-    /// The closure behind [`mark_with`](Self::mark_with) and
-    /// [`mark_with_trace`](Self::mark_with_trace).
+    /// The closure behind [`mark_with`](Self::mark_with),
+    /// [`mark_with_trace`](Self::mark_with_trace), and
+    /// [`mark_many_with`](Self::mark_many_with).
     fn mark_closure<P>(
         &mut self,
-        key: K,
-        channel: Channel,
+        roots: impl IntoIterator<Item = (K, Channel)>,
         policy: &P,
         mut tracing: Option<(&mut TraversalScratch<K>, &mut dyn InvalidationTrace<K>)>,
     ) -> MarkReport
@@ -660,9 +695,18 @@ where
         P: PropagationPolicy<K>,
     {
         let mut report = MarkReport::default();
+        let mut roots = roots.into_iter();
+        let Some((key, channel)) = roots.next() else {
+            return report;
+        };
+        let second = roots.next();
 
-        // Fast path: no cascades, no cross-channel edges — pure single-channel.
-        if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
+        // Fast path: one root, no cascades, no cross-channel edges — pure
+        // single-channel.
+        if second.is_none()
+            && self.cascade.cascades_from(channel).is_empty()
+            && self.cross_channel.is_empty()
+        {
             report.steps = 1;
             report.record(&mut self.invalidated, channel, |set| {
                 run_policy(
@@ -721,7 +765,9 @@ where
                 );
             };
         let mut worklist: VecDeque<(K, Channel, InvalidationCause<K>)> = VecDeque::new();
-        worklist.push_back((key, channel, InvalidationCause::Root));
+        for (key, channel) in core::iter::once((key, channel)).chain(second).chain(roots) {
+            worklist.push_back((key, channel, InvalidationCause::Root));
+        }
         let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
         let mut scanned = hashbrown::HashSet::<(K, Channel)>::new();
         let mut stack: Vec<K> = Vec::new();
@@ -2416,5 +2462,66 @@ mod tests {
         assert_eq!(report.newly_invalidated, 2 * n as usize + 1);
         // Every dependent is walked once in all, whatever order the steps run.
         assert!(report.keys_scanned <= 2 * n as usize, "{report:?}");
+    }
+
+    #[test]
+    fn mark_many_with_matches_marking_each_root() {
+        let mut seed = 0xBA7C_u64;
+        let mut next = |bound: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            u32::try_from(seed >> 33).unwrap() % bound
+        };
+        let channels = [LAYOUT, PAINT, Channel::new(2)];
+        for _ in 0..100 {
+            let n = 2 + next(20);
+            let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Allow);
+            for ch in channels {
+                for _ in 0..next(3 * n) {
+                    let _ = tracker.add_dependency(next(n), next(n), ch).unwrap();
+                }
+            }
+            if next(2) == 0 {
+                tracker.add_cascade(LAYOUT, PAINT).unwrap();
+            }
+            for _ in 0..next(4) {
+                tracker.add_cross_dependency(
+                    next(n),
+                    channels[next(3) as usize],
+                    next(n),
+                    channels[next(3) as usize],
+                );
+            }
+            let roots: Vec<_> = (0..next(6))
+                .map(|_| (next(n), channels[next(3) as usize]))
+                .collect();
+
+            for eager in [true, false] {
+                let mut each = tracker.clone();
+                let mut many = tracker.clone();
+                let report = if eager {
+                    for &(k, ch) in &roots {
+                        each.mark_with(k, ch, &EagerPolicy);
+                    }
+                    many.mark_many_with(roots.iter().copied(), &EagerPolicy)
+                } else {
+                    for &(k, ch) in &roots {
+                        each.mark_with(k, ch, &LazyPolicy);
+                    }
+                    many.mark_many_with(roots.iter().copied(), &LazyPolicy)
+                };
+                let mut total = 0;
+                for ch in channels {
+                    let mut want: Vec<_> = each.invalidated().iter(ch).collect();
+                    let mut got: Vec<_> = many.invalidated().iter(ch).collect();
+                    want.sort_unstable();
+                    got.sort_unstable();
+                    assert_eq!(got, want, "eager {eager}, roots {roots:?}");
+                    total += got.len();
+                }
+                assert_eq!(report.newly_invalidated, total);
+            }
+        }
     }
 }
