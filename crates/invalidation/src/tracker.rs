@@ -11,6 +11,7 @@ use crate::adaptive::PairSet;
 use crate::cascade::{CascadeCycleError, ChannelCascade};
 use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
+use crate::cycles::{ChannelReach, CrossCycleError, IndexPairs, Rules};
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
 use crate::drain_builder::{AnyOrder, CrossRules, DrainBuilder};
 use crate::graph::{
@@ -84,8 +85,16 @@ where
     cross_channel: CrossChannelEdges<K>,
     /// Names for channels in diagnostics.
     channel_names: ChannelNames,
+    /// Channel-level reachability through cascades and cross-channel edges,
+    /// computed when a cycle check needs it, and recomputed after the
+    /// cascade or the cross-channel channel pairs change.
+    reach: Option<ChannelReach>,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "`reach` is a cache derived from the cascade and cross-channel edges"
+)]
 impl<K> core::fmt::Debug for InvalidationTracker<K>
 where
     K: Copy + Eq + Hash + DenseKey + core::fmt::Debug,
@@ -263,6 +272,7 @@ where
             cascade: ChannelCascade::new(),
             cross_channel: CrossChannelEdges::new(),
             channel_names: ChannelNames::new(),
+            reach: None,
         }
     }
 
@@ -281,6 +291,7 @@ where
             cascade: ChannelCascade::from_edges(cascades)?,
             cross_channel: CrossChannelEdges::new(),
             channel_names: ChannelNames::new(),
+            reach: None,
         })
     }
 
@@ -312,6 +323,7 @@ where
             cascade: ChannelCascade::new(),
             cross_channel: CrossChannelEdges::new(),
             channel_names: ChannelNames::new(),
+            reach: None,
         }
     }
 
@@ -373,20 +385,23 @@ where
     ///
     /// Uses the tracker's configured cycle handling mode.
     ///
-    /// See [`InvalidationGraph::add_dependency`] for details.
+    /// See [`add_dependency_with`](Self::add_dependency_with) for details.
     pub fn add_dependency(
         &mut self,
         from: K,
         to: K,
         channel: Channel,
     ) -> Result<AddDependency, CycleError<K>> {
-        self.graph
-            .add_dependency(from, to, channel, self.cycle_handling)
+        self.add_dependency_with(from, to, channel, self.cycle_handling)
     }
 
     /// Adds a dependency with explicit cycle handling.
     ///
-    /// See [`InvalidationGraph::add_dependency`] for details.
+    /// Like [`InvalidationGraph::add_dependency`], but a cycle can also run
+    /// through channel cascades and cross-channel edges: `handling` applies
+    /// when invalidating `from` would, by any of the tracker's rules, come
+    /// back to `to`. [`CycleError::path`] then shows the whole chain, across
+    /// channels.
     pub fn add_dependency_with(
         &mut self,
         from: K,
@@ -394,6 +409,12 @@ where
         channel: Channel,
         handling: CycleHandling,
     ) -> Result<AddDependency, CycleError<K>> {
+        if handling != CycleHandling::Allow
+            && from != to
+            && let Some(flow) = self.crossing_flow(channel, (from, channel), (to, channel))
+        {
+            return dependency_cycle(from, to, channel, flow, handling);
+        }
         self.graph.add_dependency(from, to, channel, handling)
     }
 
@@ -424,14 +445,15 @@ where
         channel: Channel,
         to: impl IntoIterator<Item = K>,
     ) -> Result<DependencyChanges<K>, CycleError<K>> {
-        self.graph
-            .replace_dependencies(from, channel, to, self.cycle_handling)
+        self.replace_dependencies_with(from, channel, to, self.cycle_handling)
     }
 
     /// Replaces all direct dependencies of `from` in `channel`, with explicit cycle handling.
     ///
     /// See [`InvalidationGraph::replace_dependencies`](crate::InvalidationGraph::replace_dependencies) for
-    /// behavior and rollback semantics.
+    /// behavior and rollback semantics. As with
+    /// [`add_dependency_with`](Self::add_dependency_with), a cycle can also
+    /// run through channel cascades and cross-channel edges.
     pub fn replace_dependencies_with(
         &mut self,
         from: K,
@@ -439,7 +461,36 @@ where
         to: impl IntoIterator<Item = K>,
         handling: CycleHandling,
     ) -> Result<DependencyChanges<K>, CycleError<K>> {
-        self.graph.replace_dependencies(from, channel, to, handling)
+        let old: Vec<K> = self.graph.dependencies(from, channel).collect();
+        let mut changes = self
+            .graph
+            .replace_dependencies(from, channel, to, handling)?;
+        if handling == CycleHandling::Allow || changes.added.is_empty() {
+            return Ok(changes);
+        }
+        // The graph checked each new edge within the channel; check the
+        // added ones across channels too.
+        let mut kept = Vec::with_capacity(changes.added.len());
+        for dep in core::mem::take(&mut changes.added) {
+            let Some(flow) = self.crossing_flow(channel, (from, channel), (dep, channel)) else {
+                kept.push(dep);
+                continue;
+            };
+            match dependency_cycle(from, dep, channel, flow, handling) {
+                Err(error) => {
+                    let _ =
+                        self.graph
+                            .replace_dependencies(from, channel, old, CycleHandling::Allow);
+                    return Err(error);
+                }
+                Ok(_) => {
+                    let _ = self.graph.remove_dependency(from, dep, channel);
+                    changes.cycles_ignored.push(dep);
+                }
+            }
+        }
+        changes.added = kept;
+        Ok(changes)
     }
 
     /// Adds a channel cascade rule: invalidation on `from` also marks `to`.
@@ -448,16 +499,57 @@ where
     /// already existed, or `Err(CascadeCycleError)` if adding the rule would
     /// create a cycle.
     ///
-    /// See [`ChannelCascade::add_cascade`] for details.
+    /// Besides cycles among cascades (see [`ChannelCascade::add_cascade`]),
+    /// this rejects a cascade that would close a cycle through cross-channel
+    /// edges: some key whose invalidation in `to` would come back to it in
+    /// `from`. The error's path then lists the channels that cycle passes
+    /// through. Unless the tracker's cycle handling is
+    /// [`CycleHandling::Allow`], which skips the check, such a cascade is
+    /// always rejected, as cycles among cascades are.
     pub fn add_cascade(&mut self, from: Channel, to: Channel) -> Result<bool, CascadeCycleError> {
-        self.cascade.add_cascade(from, to)
+        if !self.cascade.add_cascade(from, to)? {
+            return Ok(false);
+        }
+        self.reach = None;
+        if self.cycle_handling == CycleHandling::Allow {
+            return Ok(true);
+        }
+        self.ensure_reach();
+        let reach = self.reach.as_ref().expect("just computed");
+        if !reach.reaches_crossing(to, from) {
+            return Ok(true);
+        }
+        // Any cycle runs through a cross-channel edge; look for one that
+        // comes back to its own source.
+        let rules = Rules {
+            graph: &self.graph,
+            cascade: &self.cascade,
+            cross: &self.cross_channel,
+            reach,
+        };
+        let cycle = self.cross_channel.edges().find_map(|(source, target)| {
+            rules.flow_path(target, source).map(|mut flow| {
+                flow.insert(0, source);
+                flow
+            })
+        });
+        let Some(cycle) = cycle else {
+            return Ok(true);
+        };
+        let _ = self.cascade.remove_cascade(from, to);
+        self.reach = None;
+        Err(cascade_cycle_error(from, to, &cycle))
     }
 
     /// Removes a channel cascade rule.
     ///
     /// Returns `true` if the rule existed and was removed.
     pub fn remove_cascade(&mut self, from: Channel, to: Channel) -> bool {
-        self.cascade.remove_cascade(from, to)
+        let removed = self.cascade.remove_cascade(from, to);
+        if removed {
+            self.reach = None;
+        }
+        removed
     }
 
     /// Returns a reference to the channel cascade rules.
@@ -472,16 +564,62 @@ where
     /// When `from_key` is invalidated on `from_ch`, `to_key` will also be
     /// marked on `to_ch` (when using [`mark_with`](Self::mark_with)).
     ///
-    /// Returns `true` if the edge was newly added.
+    /// Uses the tracker's configured cycle handling mode; see
+    /// [`add_cross_dependency_with`](Self::add_cross_dependency_with).
     pub fn add_cross_dependency(
         &mut self,
         from_key: K,
         from_ch: Channel,
         to_key: K,
         to_ch: Channel,
-    ) -> bool {
-        self.cross_channel
-            .add_edge(from_key, from_ch, to_key, to_ch)
+    ) -> Result<AddDependency, CrossCycleError<K>> {
+        self.add_cross_dependency_with(from_key, from_ch, to_key, to_ch, self.cycle_handling)
+    }
+
+    /// Adds a cross-channel dependency edge with explicit cycle handling.
+    ///
+    /// `handling` applies when invalidation already flows from
+    /// `(to_key, to_ch)` back to `(from_key, from_ch)`, by any of the
+    /// tracker's rules, so that the new edge would close a cycle; see
+    /// [`CycleHandling`]. Such a cycle would make every affected drain mark
+    /// work for the next one. Checking costs a channel-level lookup, and a
+    /// search over keys only when cascades and cross-channel edges let
+    /// `to_ch` reach `from_ch`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(AddDependency::Added)` if the edge was newly added.
+    /// - `Ok(AddDependency::AlreadyPresent)` if it already existed.
+    /// - `Ok(AddDependency::CycleIgnored)` if it would close a cycle and
+    ///   `handling` dropped it.
+    /// - `Err(CrossCycleError)` if it would close a cycle and `handling` is
+    ///   [`CycleHandling::Error`].
+    pub fn add_cross_dependency_with(
+        &mut self,
+        from_key: K,
+        from_ch: Channel,
+        to_key: K,
+        to_ch: Channel,
+        handling: CycleHandling,
+    ) -> Result<AddDependency, CrossCycleError<K>> {
+        let from = (from_key, from_ch);
+        let to = (to_key, to_ch);
+        if self
+            .cross_channel
+            .dependents(from_key, from_ch)
+            .any(|t| t == to)
+        {
+            return Ok(AddDependency::AlreadyPresent);
+        }
+        if handling != CycleHandling::Allow
+            && let Some(flow) = self.flow(to, from)
+        {
+            return cross_cycle(from, to, flow, handling);
+        }
+        let _ = self
+            .cross_channel
+            .add_edge(from_key, from_ch, to_key, to_ch);
+        Ok(AddDependency::Added)
     }
 
     /// Removes a cross-channel dependency edge.
@@ -504,15 +642,57 @@ where
     /// channel)` pair. Existing targets not present in `targets` are removed,
     /// new targets are added, and duplicates in `targets` are ignored.
     ///
-    /// Returns `true` if the dependent set changed.
+    /// Each new target is checked for cycles as by
+    /// [`add_cross_dependency`](Self::add_cross_dependency), with the
+    /// tracker's cycle handling. On `Err`, no changes are retained; targets
+    /// a cycle made it drop are listed in
+    /// [`DependencyChanges::cycles_ignored`].
     pub fn replace_cross_dependents(
         &mut self,
         from_key: K,
         from_ch: Channel,
         targets: impl IntoIterator<Item = (K, Channel)>,
-    ) -> bool {
-        self.cross_channel
-            .replace_dependents(from_key, from_ch, targets)
+    ) -> Result<DependencyChanges<(K, Channel)>, CrossCycleError<K>> {
+        let from = (from_key, from_ch);
+        let old: Vec<(K, Channel)> = self.cross_channel.dependents(from_key, from_ch).collect();
+        let mut new: Vec<(K, Channel)> = Vec::new();
+        for target in targets {
+            if !new.contains(&target) {
+                new.push(target);
+            }
+        }
+        let mut changes = DependencyChanges {
+            added: Vec::new(),
+            removed: old.iter().copied().filter(|t| !new.contains(t)).collect(),
+            cycles_ignored: Vec::new(),
+        };
+        // Remove first, so that the checks see the edges that will remain.
+        for &(to_key, to_ch) in &changes.removed {
+            let _ = self
+                .cross_channel
+                .remove_edge(from_key, from_ch, to_key, to_ch);
+        }
+        for &to in new.iter().filter(|t| !old.contains(t)) {
+            if self.cycle_handling != CycleHandling::Allow
+                && let Some(flow) = self.flow(to, from)
+            {
+                match cross_cycle(from, to, flow, self.cycle_handling) {
+                    Err(error) => {
+                        let _ = self
+                            .cross_channel
+                            .replace_dependents(from_key, from_ch, old);
+                        return Err(error);
+                    }
+                    Ok(_) => {
+                        changes.cycles_ignored.push(to);
+                        continue;
+                    }
+                }
+            }
+            let _ = self.cross_channel.add_edge(from_key, from_ch, to.0, to.1);
+            changes.added.push(to);
+        }
+        Ok(changes)
     }
 
     /// Removes all outgoing cross-channel edges from `(from_key, from_ch)`.
@@ -534,6 +714,51 @@ where
     #[must_use]
     pub fn cross_channel(&self) -> &CrossChannelEdges<K> {
         &self.cross_channel
+    }
+
+    /// Computes channel-level reachability if the cached one is missing or
+    /// out of date.
+    fn ensure_reach(&mut self) {
+        if !self
+            .reach
+            .as_ref()
+            .is_some_and(|reach| reach.is_current(&self.cross_channel))
+        {
+            self.reach = Some(ChannelReach::new(&self.cascade, &self.cross_channel));
+        }
+    }
+
+    /// Returns a chain along which invalidating `start` invalidates `goal`,
+    /// by any of the tracker's rules, if there is one.
+    fn flow(&mut self, start: (K, Channel), goal: (K, Channel)) -> Option<Vec<(K, Channel)>> {
+        if start == goal {
+            return Some(alloc::vec![start]);
+        }
+        self.ensure_reach();
+        Rules {
+            graph: &self.graph,
+            cascade: &self.cascade,
+            cross: &self.cross_channel,
+            reach: self.reach.as_ref().expect("just computed"),
+        }
+        .flow_path(start, goal)
+    }
+
+    /// Like [`flow`](Self::flow) between two pairs in `channel`, but only
+    /// when a chain could leave the channel and come back: chains within the
+    /// channel are the graph's to check.
+    fn crossing_flow(
+        &mut self,
+        channel: Channel,
+        start: (K, Channel),
+        goal: (K, Channel),
+    ) -> Option<Vec<(K, Channel)>> {
+        self.ensure_reach();
+        let reach = self.reach.as_ref().expect("just computed");
+        if !reach.reaches_crossing(channel, channel) {
+            return None;
+        }
+        self.flow(start, goal)
     }
 
     /// Marks a key as invalidated without graph or cross-channel propagation.
@@ -1135,6 +1360,114 @@ fn for_each_cross_successor<K>(
     }
 }
 
+/// Applies `handling` to a dependency `from -> to` in `channel` that would
+/// close a cycle, given the chain along which invalidating `from` already
+/// invalidates `to`.
+fn dependency_cycle<K>(
+    from: K,
+    to: K,
+    channel: Channel,
+    flow: Vec<(K, Channel)>,
+    handling: CycleHandling,
+) -> Result<AddDependency, CycleError<K>>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    // The error lists the chain the other way: from `to`, each pair
+    // depending on the next, back to `from`.
+    let mut path = flow;
+    path.reverse();
+    match handling {
+        CycleHandling::DebugAssert => {
+            if cfg!(debug_assertions) {
+                panic!(
+                    "adding dependency {} -> {} in {channel:?} would create a cycle through \
+                     other channels: ({}, {channel:?}){} (keys shown by DenseKey index); use \
+                     CycleHandling::Error to handle cycles as errors",
+                    from.index(),
+                    to.index(),
+                    from.index(),
+                    IndexPairs(&path),
+                );
+            }
+            Ok(AddDependency::CycleIgnored)
+        }
+        CycleHandling::Error => Err(CycleError {
+            from,
+            to,
+            channel,
+            path,
+        }),
+        CycleHandling::Ignore | CycleHandling::Allow => Ok(AddDependency::CycleIgnored),
+    }
+}
+
+/// Applies `handling` to a cross-channel edge `from -> to` that would close a
+/// cycle, given the chain along which invalidating `to` already invalidates
+/// `from`.
+fn cross_cycle<K>(
+    from: (K, Channel),
+    to: (K, Channel),
+    flow: Vec<(K, Channel)>,
+    handling: CycleHandling,
+) -> Result<AddDependency, CrossCycleError<K>>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    match handling {
+        CycleHandling::DebugAssert => {
+            if cfg!(debug_assertions) {
+                panic!(
+                    "adding cross-channel edge ({}, {:?}) -> ({}, {:?}) would create a cycle: \
+                     ({}, {:?}){} (keys shown by DenseKey index); use CycleHandling::Error to \
+                     handle cycles as errors",
+                    from.0.index(),
+                    from.1,
+                    to.0.index(),
+                    to.1,
+                    from.0.index(),
+                    from.1,
+                    IndexPairs(&flow),
+                );
+            }
+            Ok(AddDependency::CycleIgnored)
+        }
+        CycleHandling::Error => Err(CrossCycleError {
+            from,
+            to,
+            path: flow,
+        }),
+        CycleHandling::Ignore | CycleHandling::Allow => Ok(AddDependency::CycleIgnored),
+    }
+}
+
+/// Builds the error for a cascade `from -> to` that would close `cycle`, a
+/// chain of pairs that starts and ends at the same pair.
+fn cascade_cycle_error<K>(from: Channel, to: Channel, cycle: &[(K, Channel)]) -> CascadeCycleError {
+    // The channels the cycle passes through, once each in a row. The cycle
+    // starts and ends at the same pair, so drop the repeated end.
+    let mut channels: Vec<Channel> = Vec::new();
+    for &(_, channel) in &cycle[..cycle.len() - 1] {
+        if channels.last() != Some(&channel) {
+            channels.push(channel);
+        }
+    }
+    if channels.len() > 1 && channels.first() == channels.last() {
+        channels.pop();
+    }
+    // Start just after the new cascade's step, so that the path runs from
+    // `to` back to `from` as for a cycle among cascades.
+    let n = channels.len();
+    if let Some(i) = (0..n).find(|&i| channels[i] == from && channels[(i + 1) % n] == to) {
+        channels.rotate_left((i + 1) % n);
+    }
+    CascadeCycleError {
+        from,
+        to,
+        path: channels,
+    }
+}
+
 /// Runs `policy` on `(key, channel)`, reporting to the trace when there is one.
 ///
 /// The policy reports `key` as a root; `cause` is what actually reached it in
@@ -1563,7 +1896,7 @@ mod tests {
     fn cross_channel_mark_with_follows_edges() {
         let mut tracker = InvalidationTracker::<u32>::new();
         // Node 1's LAYOUT output feeds node 2's PAINT input.
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -1577,7 +1910,7 @@ mod tests {
     fn cross_channel_with_same_channel_deps() {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(3, 2, PAINT).unwrap();
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -1590,7 +1923,9 @@ mod tests {
     fn cross_channel_with_cascade() {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(1, PAINT, 2, COMPOSITE);
+        tracker
+            .add_cross_dependency(1, PAINT, 2, COMPOSITE)
+            .unwrap();
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -1603,7 +1938,7 @@ mod tests {
     #[test]
     fn cross_channel_remove_edge() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
         assert!(tracker.remove_cross_dependency(1, LAYOUT, 2, PAINT));
         assert!(!tracker.remove_cross_dependency(1, LAYOUT, 2, PAINT));
 
@@ -1614,11 +1949,20 @@ mod tests {
     #[test]
     fn cross_channel_replace_dependents() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
-        tracker.add_cross_dependency(1, LAYOUT, 3, COMPOSITE);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
+        tracker
+            .add_cross_dependency(1, LAYOUT, 3, COMPOSITE)
+            .unwrap();
 
-        assert!(tracker.replace_cross_dependents(1, LAYOUT, [(3, COMPOSITE), (4, PAINT)]));
-        assert!(!tracker.replace_cross_dependents(1, LAYOUT, [(4, PAINT), (3, COMPOSITE)]));
+        let changes = tracker
+            .replace_cross_dependents(1, LAYOUT, [(3, COMPOSITE), (4, PAINT)])
+            .unwrap();
+        assert_eq!(changes.added, vec![(4, PAINT)]);
+        assert_eq!(changes.removed, vec![(2, PAINT)]);
+        let changes = tracker
+            .replace_cross_dependents(1, LAYOUT, [(4, PAINT), (3, COMPOSITE)])
+            .unwrap();
+        assert!(!changes.changed());
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -1630,8 +1974,10 @@ mod tests {
     #[test]
     fn cross_channel_clear_dependents_and_dependencies() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(1, LAYOUT, 3, PAINT);
-        tracker.add_cross_dependency(2, COMPOSITE, 3, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 3, PAINT).unwrap();
+        tracker
+            .add_cross_dependency(2, COMPOSITE, 3, PAINT)
+            .unwrap();
 
         assert!(tracker.clear_cross_dependents(1, LAYOUT));
         assert!(!tracker.clear_cross_dependents(1, LAYOUT));
@@ -1656,7 +2002,7 @@ mod tests {
     #[test]
     fn cross_channel_remove_key_cleans_edges() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
         tracker.mark(1, LAYOUT);
 
         tracker.remove_key(1);
@@ -1675,7 +2021,7 @@ mod tests {
     fn cross_channel_accessor() {
         let mut tracker = InvalidationTracker::<u32>::new();
         assert!(tracker.cross_channel().is_empty());
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
         assert!(!tracker.cross_channel().is_empty());
     }
 
@@ -1750,7 +2096,7 @@ mod tests {
     #[test]
     fn transitive_dependents_cross_with_cross_edges() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
         tracker.add_dependency(3, 2, PAINT).unwrap();
 
         let deps = tracker.transitive_dependents_cross(1, LAYOUT);
@@ -1768,7 +2114,9 @@ mod tests {
         // Cascade LAYOUT -> PAINT.
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
         // Cross-channel: (2, LAYOUT) -> (3, COMPOSITE).
-        tracker.add_cross_dependency(2, LAYOUT, 3, COMPOSITE);
+        tracker
+            .add_cross_dependency(2, LAYOUT, 3, COMPOSITE)
+            .unwrap();
 
         let deps = tracker.transitive_dependents_cross(1, LAYOUT);
 
@@ -1787,7 +2135,7 @@ mod tests {
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
 
         // Diamond: both cascade and cross-channel lead to (1, PAINT).
-        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT).unwrap();
 
         let deps = tracker.transitive_dependents_cross(1, LAYOUT);
         // (1, PAINT) should appear exactly once.
@@ -1807,7 +2155,7 @@ mod tests {
         // 0 -> 1 on LAYOUT (1 depends on 0).
         tracker.add_dependency(1, 0, LAYOUT).unwrap();
         // Cross-channel edge from key 1 (not the root!).
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
 
         tracker.mark_with(0, LAYOUT, &EagerPolicy);
 
@@ -1852,7 +2200,7 @@ mod tests {
         // COMPOSITE. The cascade on the target channel must fire.
         let mut tracker = InvalidationTracker::<u32>::new();
 
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
         tracker.add_cascade(PAINT, COMPOSITE).unwrap();
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
@@ -1870,8 +2218,10 @@ mod tests {
         // mark_with(1, LAYOUT) must realize the full chain.
         let mut tracker = InvalidationTracker::<u32>::new();
 
-        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT);
-        tracker.add_cross_dependency(2, PAINT, 3, COMPOSITE);
+        tracker.add_cross_dependency(1, LAYOUT, 2, PAINT).unwrap();
+        tracker
+            .add_cross_dependency(2, PAINT, 3, COMPOSITE)
+            .unwrap();
 
         tracker.mark_with(1, LAYOUT, &EagerPolicy);
 
@@ -1893,8 +2243,12 @@ mod tests {
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_dependency(3, 2, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(2, LAYOUT, 4, COMPOSITE);
-        tracker.add_cross_dependency(4, COMPOSITE, 5, PAINT);
+        tracker
+            .add_cross_dependency(2, LAYOUT, 4, COMPOSITE)
+            .unwrap();
+        tracker
+            .add_cross_dependency(4, COMPOSITE, 5, PAINT)
+            .unwrap();
         tracker.add_dependency(6, 5, PAINT).unwrap();
 
         // Query the expected closure.
@@ -1919,7 +2273,9 @@ mod tests {
 
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(2, LAYOUT, 3, COMPOSITE);
+        tracker
+            .add_cross_dependency(2, LAYOUT, 3, COMPOSITE)
+            .unwrap();
 
         tracker.mark_with(1, LAYOUT, &LazyPolicy);
 
@@ -1935,7 +2291,7 @@ mod tests {
     #[test]
     fn custom_policy_off_graph_marks_do_not_trigger_cross_channel_follow_up() {
         let mut tracker = InvalidationTracker::<u32>::new();
-        tracker.add_cross_dependency(9, LAYOUT, 10, PAINT);
+        tracker.add_cross_dependency(9, LAYOUT, 10, PAINT).unwrap();
 
         let policy = OffGraphMarkPolicy { extra_key: 9 };
         tracker.mark_with(1, LAYOUT, &policy);
@@ -1999,7 +2355,7 @@ mod tests {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT).unwrap();
 
         let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
         // (1, L), (2, L), (1, P), (2, P), (9, L), (9, P).
@@ -2016,7 +2372,7 @@ mod tests {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT).unwrap();
 
         let mut scratch = TraversalScratch::new();
         let mut trace = OneParentRecorder::new();
@@ -2058,7 +2414,9 @@ mod tests {
             tracker.add_dependency(2, 1, LAYOUT).unwrap();
             tracker.add_dependency(3, 2, PAINT).unwrap();
             tracker.add_cascade(LAYOUT, PAINT).unwrap();
-            tracker.add_cross_dependency(3, PAINT, 1, Channel::new(2));
+            tracker
+                .add_cross_dependency(3, PAINT, 1, Channel::new(2))
+                .unwrap();
             tracker
         };
         for lazy in [false, true] {
@@ -2147,7 +2505,7 @@ mod tests {
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_dependency(3, 1, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(3, PAINT, 9, LAYOUT);
+        tracker.add_cross_dependency(3, PAINT, 9, LAYOUT).unwrap();
         tracker.mark(1, PAINT);
 
         let graph = tracker.graph();
@@ -2171,7 +2529,7 @@ mod tests {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_cascade(LAYOUT, PAINT).unwrap();
-        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT).unwrap();
         tracker.mark(7, PAINT);
         tracker.set_channel_names(
             ChannelNames::new()
@@ -2208,7 +2566,7 @@ mod tests {
         );
 
         tracker.clear_all();
-        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
+        tracker.add_cross_dependency(1, LAYOUT, 1, PAINT).unwrap();
         let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
         // (1, LAYOUT) and (1, PAINT); the layout step scans 2 and 3.
         assert_eq!(report.steps, 2);
@@ -2282,12 +2640,14 @@ mod tests {
                 }
             }
             for _ in 0..next(6) {
-                tracker.add_cross_dependency(
-                    next(n),
-                    channels[next(3) as usize],
-                    next(n),
-                    channels[next(3) as usize],
-                );
+                tracker
+                    .add_cross_dependency(
+                        next(n),
+                        channels[next(3) as usize],
+                        next(n),
+                        channels[next(3) as usize],
+                    )
+                    .unwrap();
             }
             for _ in 0..next(4) {
                 tracker.mark(next(n), channels[next(3) as usize]);
@@ -2354,7 +2714,7 @@ mod tests {
         const A11Y: Channel = Channel::new(2);
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
-        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT).unwrap();
         tracker.add_cascade(PAINT, A11Y).unwrap();
 
         tracker.mark_with(1, LAYOUT, &LazyPolicy);
@@ -2374,7 +2734,7 @@ mod tests {
         // A direct mark follows no cross-channel edges, and this edge did not
         // exist when 2 was marked; the drain follows it anyway.
         tracker.mark(2, LAYOUT);
-        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT).unwrap();
         let _ = tracker.drain_affected_sorted(LAYOUT).count();
         assert!(tracker.is_invalidated(9, PAINT));
     }
@@ -2383,7 +2743,7 @@ mod tests {
     fn work_passed_on_by_a_drain_is_marked_as_roots() {
         let mut tracker = InvalidationTracker::<u32>::new();
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
-        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT);
+        tracker.add_cross_dependency(2, LAYOUT, 9, PAINT).unwrap();
         tracker.add_dependency(10, 9, PAINT).unwrap();
         tracker.mark(1, LAYOUT);
         let _ = tracker.drain_affected_sorted(LAYOUT).count();
@@ -2403,7 +2763,7 @@ mod tests {
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_dependency(3, 1, LAYOUT).unwrap();
         // A same-channel cross edge into a key this drain yields anyway.
-        tracker.add_cross_dependency(2, LAYOUT, 3, LAYOUT);
+        tracker.add_cross_dependency(2, LAYOUT, 3, LAYOUT).unwrap();
         tracker.mark_with(1, LAYOUT, &LazyPolicy);
 
         let drained: Vec<_> = tracker
@@ -2476,7 +2836,9 @@ mod tests {
             tracker.add_dependency(n + 1 + i, n + i, PAINT).unwrap();
         }
         for key in 1..=n {
-            tracker.add_cross_dependency(key, LAYOUT, 2 * n + 1 - key, PAINT);
+            tracker
+                .add_cross_dependency(key, LAYOUT, 2 * n + 1 - key, PAINT)
+                .unwrap();
         }
 
         let report = tracker.mark_with(0, LAYOUT, &EagerPolicy);
@@ -2507,12 +2869,14 @@ mod tests {
                 tracker.add_cascade(LAYOUT, PAINT).unwrap();
             }
             for _ in 0..next(4) {
-                tracker.add_cross_dependency(
-                    next(n),
-                    channels[next(3) as usize],
-                    next(n),
-                    channels[next(3) as usize],
-                );
+                tracker
+                    .add_cross_dependency(
+                        next(n),
+                        channels[next(3) as usize],
+                        next(n),
+                        channels[next(3) as usize],
+                    )
+                    .unwrap();
             }
             let roots: Vec<_> = (0..next(6))
                 .map(|_| (next(n), channels[next(3) as usize]))
@@ -2611,22 +2975,20 @@ mod tests {
                         let _ = tracker.add_dependency(a, b, ch).unwrap();
                     }
                     2 => {
+                        // Any direction: the tracker rejects cascades that
+                        // would close a cycle, through cross-channel edges
+                        // too, unless cycles are allowed.
                         let (a, b) = (next(3) as usize, next(3) as usize);
-                        if a < b {
-                            log.push(alloc::format!("cascade {a}->{b}"));
-                            let _ = tracker.add_cascade(channels[a], channels[b]);
-                        }
+                        let added = tracker.add_cascade(channels[a], channels[b]);
+                        log.push(alloc::format!("cascade {a}->{b}: {added:?}"));
                     }
                     3 => {
                         let (a, b) = (next(n), next(n));
                         let to = channels[next(3) as usize];
-                        // Like cascades, cross-channel edges that only point
-                        // to later channels cannot form a cycle.
-                        if !cycles && to.index() <= ch.index() {
-                            continue;
-                        }
-                        log.push(alloc::format!("cross ({a},{ch:?})->({b},{to:?})"));
-                        tracker.add_cross_dependency(a, ch, b, to);
+                        let added = tracker.add_cross_dependency(a, ch, b, to).unwrap();
+                        log.push(alloc::format!(
+                            "cross ({a},{ch:?})->({b},{to:?}): {added:?}"
+                        ));
                     }
                     4 | 5 => {
                         let key = next(n);
@@ -2698,5 +3060,153 @@ mod tests {
     #[test]
     fn operation_sequences_with_cycles_keep_undrained_work() {
         run_sequences(true, 400);
+    }
+
+    /// Layout cascades to paint, and 9's paint feeds 1's layout. Invalidating
+    /// (1, LAYOUT) reaches (9, PAINT) once 9 lays out from 1.
+    fn tracker_with_paint_feeding_layout(handling: CycleHandling) -> InvalidationTracker<u32> {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(handling);
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker
+            .add_cross_dependency_with(9, PAINT, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        tracker
+    }
+
+    #[test]
+    fn dependency_closing_a_cycle_through_other_channels_is_rejected() {
+        let mut tracker = tracker_with_paint_feeding_layout(CycleHandling::Error);
+        // 9 lays out from 1: (1, L) -> (9, L) -> (9, P) -> (1, L).
+        let err = tracker.add_dependency(9, 1, LAYOUT).unwrap_err();
+        assert_eq!(
+            err.path,
+            vec![(1, LAYOUT), (9, PAINT), (9, LAYOUT)],
+            "from (1, L), each pair depends on the next, back to (9, L)"
+        );
+        assert_eq!(
+            alloc::format!("{err}"),
+            "adding dependency 9 -> 1 in Channel(0) would create a cycle: \
+             (9, Channel(0)) -> (1, Channel(0)) -> (9, Channel(1)) -> (9, Channel(0))"
+        );
+        assert!(!tracker.graph().dependencies(9, LAYOUT).any(|k| k == 1));
+
+        let mut ignoring = tracker_with_paint_feeding_layout(CycleHandling::Ignore);
+        assert_eq!(
+            ignoring.add_dependency(9, 1, LAYOUT),
+            Ok(AddDependency::CycleIgnored)
+        );
+        let mut allowing = tracker_with_paint_feeding_layout(CycleHandling::Allow);
+        assert_eq!(
+            allowing.add_dependency(9, 1, LAYOUT),
+            Ok(AddDependency::Added)
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "would create a cycle through other channels: (9, Channel(0))")]
+    fn debug_assert_names_a_cycle_through_other_channels() {
+        let mut tracker = tracker_with_paint_feeding_layout(CycleHandling::DebugAssert);
+        let _ = tracker.add_dependency(9, 1, LAYOUT);
+    }
+
+    #[test]
+    fn cross_edge_closing_a_cycle_is_rejected() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        // (1, L) -> (2, L) -> (2, P); an edge back to (1, L) closes it.
+        let err = tracker
+            .add_cross_dependency(2, PAINT, 1, LAYOUT)
+            .unwrap_err();
+        assert_eq!(err.from, (2, PAINT));
+        assert_eq!(err.to, (1, LAYOUT));
+        assert_eq!(err.path, vec![(1, LAYOUT), (2, LAYOUT), (2, PAINT)]);
+        assert_eq!(tracker.cross_channel().len(), 0);
+        // An edge to itself is a cycle too.
+        assert!(tracker.add_cross_dependency(5, PAINT, 5, PAINT).is_err());
+        // Edges that go on downstream are fine, and so are repeats.
+        assert_eq!(
+            tracker.add_cross_dependency(2, PAINT, 3, Channel::new(2)),
+            Ok(AddDependency::Added)
+        );
+        assert_eq!(
+            tracker.add_cross_dependency(2, PAINT, 3, Channel::new(2)),
+            Ok(AddDependency::AlreadyPresent)
+        );
+    }
+
+    #[test]
+    fn cascade_closing_a_cycle_through_cross_edges_is_rejected() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_cross_dependency(1, PAINT, 1, LAYOUT).unwrap();
+        // Layout cascading to paint would make (1, L) -> (1, P) -> (1, L).
+        let err = tracker.add_cascade(LAYOUT, PAINT).unwrap_err();
+        assert_eq!((err.from, err.to), (LAYOUT, PAINT));
+        assert_eq!(err.path, vec![PAINT, LAYOUT]);
+        assert!(tracker.cascade().is_empty(), "the cascade was not kept");
+        // Unrelated cascades are still fine.
+        assert_eq!(tracker.add_cascade(LAYOUT, Channel::new(2)), Ok(true));
+    }
+
+    #[test]
+    fn replace_dependencies_checks_cycles_across_channels() {
+        let mut tracker = tracker_with_paint_feeding_layout(CycleHandling::Error);
+        tracker.add_dependency(9, 5, LAYOUT).unwrap();
+        assert!(tracker.replace_dependencies(9, LAYOUT, [6, 1]).is_err());
+        let mut kept: Vec<_> = tracker.graph().dependencies(9, LAYOUT).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![5], "an error keeps no changes");
+
+        let mut ignoring = tracker_with_paint_feeding_layout(CycleHandling::Ignore);
+        ignoring.add_dependency(9, 5, LAYOUT).unwrap();
+        let changes = ignoring.replace_dependencies(9, LAYOUT, [6, 1]).unwrap();
+        assert_eq!(changes.added, vec![6]);
+        assert_eq!(changes.removed, vec![5]);
+        assert_eq!(changes.cycles_ignored, vec![1]);
+        let mut kept: Vec<_> = ignoring.graph().dependencies(9, LAYOUT).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![6]);
+    }
+
+    #[test]
+    fn replace_cross_dependents_checks_cycles() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker
+            .add_cross_dependency(1, PAINT, 7, COMPOSITE)
+            .unwrap();
+        assert!(
+            tracker
+                .replace_cross_dependents(1, PAINT, [(8, COMPOSITE), (1, LAYOUT)])
+                .is_err()
+        );
+        assert_eq!(
+            tracker.cross_channel().edges().collect::<Vec<_>>(),
+            vec![((1, PAINT), (7, COMPOSITE))],
+            "an error keeps no changes"
+        );
+
+        let mut ignoring = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Ignore);
+        ignoring.add_cascade(LAYOUT, PAINT).unwrap();
+        let changes = ignoring
+            .replace_cross_dependents(1, PAINT, [(8, COMPOSITE), (1, LAYOUT)])
+            .unwrap();
+        assert_eq!(changes.added, vec![(8, COMPOSITE)]);
+        assert_eq!(changes.cycles_ignored, vec![(1, LAYOUT)]);
+    }
+
+    #[test]
+    fn channel_reach_cache_follows_rule_changes() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_cross_dependency(1, PAINT, 1, LAYOUT).unwrap();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        // Removing the edge must let the cascade in.
+        assert!(tracker.remove_cross_dependency(1, PAINT, 1, LAYOUT));
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        // And with the cascade in, the edge back must be refused again.
+        assert!(tracker.add_cross_dependency(2, PAINT, 1, LAYOUT).is_err());
+        assert!(tracker.remove_cascade(LAYOUT, PAINT));
+        assert!(tracker.add_cross_dependency(2, PAINT, 1, LAYOUT).is_ok());
     }
 }
