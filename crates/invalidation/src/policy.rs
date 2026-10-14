@@ -78,6 +78,18 @@ where
         invalidated: &mut InvalidationSet<K>,
     );
 
+    /// Returns `true` if [`propagate`](Self::propagate) always marks every
+    /// transitive dependent of its key, as [`EagerPolicy`] does.
+    ///
+    /// [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with)
+    /// uses this to skip running the policy again on a key whose dependents an
+    /// earlier run already marked; without it, marking through cascades or
+    /// cross-channel edges re-walks the same dependents once per key. The
+    /// default is `false`, which is always correct.
+    fn marks_all_dependents(&self) -> bool {
+        false
+    }
+
     /// Propagates like [`propagate`](Self::propagate), while reporting each
     /// `(key, channel)` it reaches to `trace`.
     ///
@@ -158,6 +170,10 @@ where
         for dependent in graph.transitive_dependents(key, channel) {
             invalidated.mark(dependent, channel);
         }
+    }
+
+    fn marks_all_dependents(&self) -> bool {
+        true
     }
 
     /// Propagates eagerly while reporting the root and one edge per
@@ -310,6 +326,10 @@ where
         invalidated: &mut InvalidationSet<K>,
     ) {
         (*self).propagate(key, channel, graph, invalidated);
+    }
+
+    fn marks_all_dependents(&self) -> bool {
+        (*self).marks_all_dependents()
     }
 
     fn propagate_with_trace(
