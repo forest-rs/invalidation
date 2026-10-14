@@ -13,10 +13,10 @@ use alloc::vec::Vec;
 use core::cmp::Reverse;
 use core::hash::Hash;
 
-use hashbrown::HashMap;
-use hashbrown::hash_map::Entry;
+use core::fmt;
 
 use crate::DrainBuilder;
+use crate::adaptive::InDegrees;
 use crate::channel::Channel;
 use crate::graph::InvalidationGraph;
 use crate::scratch::TraversalScratch;
@@ -25,14 +25,15 @@ use crate::trace::InvalidationTrace;
 
 /// Trait for keys that can be used as dense `Vec` indices.
 ///
-/// This is used by [`DrainSortedDeterministic`] to replace `HashMap`-based
-/// in-degree tracking with a `Vec` indexed by key, eliminating hashing from
-/// the hot path.
+/// [`InvalidationGraph`] stores adjacency in `Vec`s indexed by key, and the
+/// drains keep in-degrees the same way while the keys they drain are compact,
+/// eliminating hashing from the hot path.
 ///
-/// Keys must map to compact sequential `usize` indices (typically starting
-/// from 0). Sparse integer key spaces are not supported; very large indices
-/// panic if the required dense storage would exceed addressable capacity or
-/// the available memory budget. Use
+/// Keys with edges must map to compact sequential `usize` indices (typically
+/// starting from 0): the graph's storage grows with the largest index that
+/// has an edge, and very large indices panic if that storage would exceed
+/// addressable capacity or the available memory budget. Keys without edges
+/// can be anything. Use
 /// [`intern::Interner`](crate::intern::Interner) when your natural key space
 /// is not already compact.
 ///
@@ -55,9 +56,6 @@ impl DenseKey for usize {
         self
     }
 }
-
-/// Sentinel value indicating a key is not in the invalidation set.
-const DENSE_SENTINEL: u32 = u32::MAX;
 
 #[inline]
 pub(crate) fn prepare_dense_growth<T>(vec: &mut Vec<T>, idx: usize, storage: &str) -> usize {
@@ -108,7 +106,10 @@ pub enum DrainCompletion {
 ///
 /// - Time complexity: O(V + E) where V is the number of invalidated keys and E is
 ///   the number of edges between them.
-/// - Space complexity: O(V) for the in-degree map and queue.
+/// - Space complexity: O(V). In-degrees live in a table indexed by
+///   [`DenseKey::index`] while the drained keys are compact, and in a hash map
+///   for keys too sparse for that, so a few keys with huge indices cost no
+///   more than they would in a hash map.
 ///
 /// # Keys Not Yielded
 ///
@@ -136,8 +137,8 @@ pub enum DrainCompletion {
 ///   Use [`CycleHandling::Error`](crate::CycleHandling::Error) when building the graph
 ///   to prevent cycles, or ensure cycles are intentional.
 /// - **Nondeterminism**: When multiple keys have in-degree zero simultaneously,
-///   the order among them depends on hash iteration order and is not guaranteed
-///   to be deterministic across runs or platforms.
+///   the order among them depends on the invalidated set's hash iteration
+///   order and is not guaranteed to be deterministic across runs or platforms.
 ///
 /// # Example
 ///
@@ -164,24 +165,15 @@ pub struct DrainSorted<'a, K>
 where
     K: Copy + Eq + Hash + DenseKey,
 {
-    graph: &'a InvalidationGraph<K>,
-    channel: Channel,
+    kahn: Kahn<'a, K>,
     /// Keys with zero in-degree, ready to yield.
-    queue: VecDeque<K>,
-    /// Remaining in-degree for each invalidated key (within the invalidated subset).
-    in_degree: HashMap<K, usize>,
-    stalled: bool,
-    /// The set that keys not yet yielded return to on drop; `None` for peeks.
-    owner: Option<&'a mut InvalidationSet<K>>,
+    ready: VecDeque<K>,
 }
 
 /// Deterministic variant of [`DrainSorted`].
 ///
 /// When multiple keys are simultaneously ready, this drain yields the smallest
 /// key first (according to `Ord`).
-///
-/// Uses a dense `Vec<u32>` indexed by [`DenseKey::index`] instead of a
-/// `HashMap` for in-degree tracking, eliminating all hashing from the hot path.
 ///
 /// Like [`DrainSorted`], it marks the keys it has not yielded invalidated
 /// again when it is dropped.
@@ -190,77 +182,198 @@ pub struct DrainSortedDeterministic<'a, K>
 where
     K: Copy + Eq + Hash + Ord + DenseKey,
 {
-    graph: &'a InvalidationGraph<K>,
-    channel: Channel,
+    kahn: Kahn<'a, K>,
     /// Keys with zero in-degree, ready to yield (min-heap via `Reverse`).
     ready: BinaryHeap<Reverse<K>>,
-    /// In-degree for each key, indexed by `key.index()`.
-    /// `DENSE_SENTINEL` means the key is not in the invalidation set.
-    in_degree: Vec<u32>,
-    /// Number of keys remaining (replaces `HashMap::len()`).
-    remaining: usize,
-    /// Every key the drain took; those whose in-degree is not the sentinel are
-    /// not yielded yet.
+}
+
+/// The state both drains share: Kahn's algorithm over the drained keys.
+///
+/// In-degrees live in a table indexed by [`DenseKey::index`] for compact
+/// keys, so the hot path does no hashing, and in a hash map for keys too
+/// sparse for that (see [`InDegrees`]).
+struct Kahn<'a, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    graph: &'a InvalidationGraph<K>,
+    channel: Channel,
+    /// In-degree of each key not yielded yet, within the drained subset.
+    in_degree: InDegrees<K>,
+    /// Every key the drain took, deduplicated.
     keys: Vec<K>,
     stalled: bool,
     /// The set that keys not yet yielded return to on drop; `None` for peeks.
     owner: Option<&'a mut InvalidationSet<K>>,
 }
 
-impl<'a, K> DrainSorted<'a, K>
+impl<K> fmt::Debug for Kahn<'_, K>
+where
+    K: Copy + Eq + Hash + DenseKey + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Kahn")
+            .field("channel", &self.channel)
+            .field("remaining", &self.in_degree.len())
+            .field("stalled", &self.stalled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, K> Kahn<'a, K>
 where
     K: Copy + Eq + Hash + DenseKey,
 {
-    pub(crate) fn from_iter_with_capacity<I>(
-        invalidated_keys: I,
-        cap: usize,
+    /// Takes `keys`, computes their in-degrees within the drained subset, and
+    /// queues each key that is ready right away.
+    fn new(
+        mut keys: Vec<K>,
         graph: &'a InvalidationGraph<K>,
         channel: Channel,
-    ) -> Self
-    where
-        I: Iterator<Item = K>,
-    {
-        // Deduplicate input keys via the in-degree map keys.
-        let mut in_degree: HashMap<K, usize> = HashMap::with_capacity(cap);
-        let mut unique_keys = Vec::with_capacity(cap);
-        for key in invalidated_keys {
-            if let Entry::Vacant(e) = in_degree.entry(key) {
-                e.insert(0);
-                unique_keys.push(key);
-            }
-        }
+        ready: &mut impl ReadyQueue<K>,
+    ) -> Self {
+        // Deduplicate the keys in place via the in-degree map.
+        let mut in_degree = InDegrees::for_keys(&keys);
+        keys.retain(|&key| in_degree.insert(key));
+        let unique_keys = keys;
 
-        // Compute in-degrees: for each invalidated key, count how many of its
-        // dependencies are also invalidated.
+        // Compute in-degrees within the drained subset.
         for &key in &unique_keys {
-            for dep in graph.dependencies(key, channel) {
-                if in_degree.contains_key(&dep) {
-                    *in_degree.get_mut(&key).expect("key is in in_degree") += 1;
-                }
-            }
+            let degree = graph
+                .dependencies(key, channel)
+                .filter(|&dep| in_degree.get(dep).is_some())
+                .count();
+            *in_degree.get_mut(key).expect("every key was inserted") =
+                u32::try_from(degree).expect("in-degree fits in u32");
         }
 
-        // Initialize queue with keys that have no invalidated dependencies
-        let mut queue = VecDeque::with_capacity(in_degree.len());
-        queue.extend(
-            unique_keys
-                .into_iter()
-                .filter(|&k| in_degree.get(&k).is_some_and(|&deg| deg == 0)),
-        );
+        // Reserve the queue only now that the input is consumed, so the two
+        // are never allocated at once.
+        ready.reserve(unique_keys.len());
+        for &key in &unique_keys {
+            if in_degree.get(key) == Some(0) {
+                ready.push(key);
+            }
+        }
 
         Self {
             graph,
             channel,
-            queue,
             in_degree,
+            keys: unique_keys,
             stalled: false,
             owner: None,
         }
     }
 
+    /// Returns the number of keys not yielded yet.
+    fn remaining(&self) -> usize {
+        self.in_degree.len()
+    }
+
+    /// Yields `key`, queueing each dependent it makes ready.
+    fn yield_key(&mut self, key: K, ready: &mut impl ReadyQueue<K>) {
+        self.in_degree.remove(key);
+        for dependent in self.graph.dependents(key, self.channel) {
+            if let Some(degree) = self.in_degree.get_mut(dependent) {
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(dependent);
+                }
+            }
+        }
+    }
+
+    /// Records that the ready queue ran dry.
+    fn exhausted(&mut self) {
+        if self.remaining() > 0 {
+            self.stalled = true;
+        }
+    }
+
+    /// Returns the keys not yielded yet.
+    fn pending(&self) -> impl Iterator<Item = K> + '_ {
+        self.keys
+            .iter()
+            .copied()
+            .filter(|&key| self.in_degree.get(key).is_some())
+    }
+
+    fn remaining_keys(&self) -> Vec<K> {
+        self.pending().collect()
+    }
+
+    fn completion(&self) -> DrainCompletion {
+        if self.stalled {
+            DrainCompletion::Stalled {
+                remaining: self.remaining(),
+            }
+        } else {
+            DrainCompletion::Complete
+        }
+    }
+}
+
+/// The queue of keys ready to yield: first-in, first-out for [`DrainSorted`],
+/// smallest first for [`DrainSortedDeterministic`].
+trait ReadyQueue<K> {
+    fn reserve(&mut self, additional: usize);
+    fn push(&mut self, key: K);
+}
+
+impl<K> ReadyQueue<K> for VecDeque<K> {
+    fn reserve(&mut self, additional: usize) {
+        Self::reserve(self, additional);
+    }
+
+    fn push(&mut self, key: K) {
+        self.push_back(key);
+    }
+}
+
+impl<K: Ord> ReadyQueue<K> for BinaryHeap<Reverse<K>> {
+    fn reserve(&mut self, additional: usize) {
+        Self::reserve(self, additional);
+    }
+
+    fn push(&mut self, key: K) {
+        Self::push(self, Reverse(key));
+    }
+}
+
+impl<K> Drop for Kahn<'_, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    fn drop(&mut self) {
+        if self.remaining() == 0 {
+            return;
+        }
+        if let Some(owner) = self.owner.take() {
+            for key in self.pending() {
+                owner.mark(key, self.channel);
+            }
+        }
+    }
+}
+
+impl<'a, K> DrainSorted<'a, K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    pub(crate) fn from_keys(
+        keys: Vec<K>,
+        graph: &'a InvalidationGraph<K>,
+        channel: Channel,
+    ) -> Self {
+        let mut ready = VecDeque::new();
+        let kahn = Kahn::new(keys, graph, channel, &mut ready);
+        Self { kahn, ready }
+    }
+
     /// Makes the drain return the keys it has not yielded to `owner` on drop.
     pub(crate) fn returning_to(mut self, owner: &'a mut InvalidationSet<K>) -> Self {
-        self.owner = Some(owner);
+        self.kahn.owner = Some(owner);
         self
     }
 
@@ -271,13 +384,13 @@ where
     /// [`is_stalled`](Self::is_stalled).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.ready.is_empty()
     }
 
-    /// Returns an upper bound on the remaining keys.
+    /// Returns the number of keys not yielded yet.
     #[must_use]
     pub fn remaining(&self) -> usize {
-        self.in_degree.len()
+        self.kahn.remaining()
     }
 
     /// Returns the keys this drain has not yielded, in unspecified order.
@@ -287,7 +400,7 @@ where
     /// which never took them.
     #[must_use]
     pub fn remaining_keys(&self) -> Vec<K> {
-        self.in_degree.keys().copied().collect()
+        self.kahn.remaining_keys()
     }
 
     /// Returns `true` if the drain has stalled due to a cycle.
@@ -298,7 +411,7 @@ where
     /// This is only meaningful after the iterator has been exhausted.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        self.stalled
+        self.kahn.stalled
     }
 
     /// Returns whether the drain completed or stalled due to a cycle.
@@ -310,19 +423,13 @@ where
     /// avoid accidental early checks.
     #[must_use]
     pub fn completion(&self) -> DrainCompletion {
-        if self.stalled {
-            DrainCompletion::Stalled {
-                remaining: self.remaining(),
-            }
-        } else {
-            DrainCompletion::Complete
-        }
+        self.kahn.completion()
     }
 
     /// Collects all yielded keys and returns completion status.
     #[must_use]
     pub fn collect_with_completion(mut self) -> (Vec<K>, DrainCompletion) {
-        let mut out = Vec::with_capacity(self.in_degree.len());
+        let mut out = Vec::with_capacity(self.kahn.remaining());
         out.extend(&mut self);
         let completion = self.completion();
         (out, completion)
@@ -333,66 +440,19 @@ impl<'a, K> DrainSortedDeterministic<'a, K>
 where
     K: Copy + Eq + Hash + Ord + DenseKey,
 {
-    pub(crate) fn from_iter_with_capacity<I>(
-        invalidated_keys: I,
-        cap: usize,
+    pub(crate) fn from_keys(
+        keys: Vec<K>,
         graph: &'a InvalidationGraph<K>,
         channel: Channel,
-    ) -> Self
-    where
-        I: Iterator<Item = K>,
-    {
-        // Deduplicate input keys via the dense in-degree vec.
-        let mut in_degree: Vec<u32> = Vec::new();
-        let mut unique_keys = Vec::with_capacity(cap);
-        for key in invalidated_keys {
-            let idx = key.index();
-            if idx >= in_degree.len() {
-                let target_len =
-                    prepare_dense_growth(&mut in_degree, idx, "deterministic drain in-degree");
-                in_degree.resize(target_len, DENSE_SENTINEL);
-            }
-            if in_degree[idx] == DENSE_SENTINEL {
-                in_degree[idx] = 0;
-                unique_keys.push(key);
-            }
-        }
-
-        // Compute in-degrees within the invalidated subset.
-        for &key in &unique_keys {
-            for dep in graph.dependencies(key, channel) {
-                let dep_idx = dep.index();
-                if dep_idx < in_degree.len() && in_degree[dep_idx] != DENSE_SENTINEL {
-                    in_degree[key.index()] += 1;
-                }
-            }
-        }
-
-        let remaining = unique_keys.len();
-
-        // Initialize ready set with zero in-degree keys.
-        let mut ready = BinaryHeap::with_capacity(remaining);
-        for &key in &unique_keys {
-            if in_degree[key.index()] == 0 {
-                ready.push(Reverse(key));
-            }
-        }
-
-        Self {
-            graph,
-            channel,
-            ready,
-            in_degree,
-            remaining,
-            keys: unique_keys,
-            stalled: false,
-            owner: None,
-        }
+    ) -> Self {
+        let mut ready = BinaryHeap::new();
+        let kahn = Kahn::new(keys, graph, channel, &mut ready);
+        Self { kahn, ready }
     }
 
     /// Makes the drain return the keys it has not yielded to `owner` on drop.
     pub(crate) fn returning_to(mut self, owner: &'a mut InvalidationSet<K>) -> Self {
-        self.owner = Some(owner);
+        self.kahn.owner = Some(owner);
         self
     }
 
@@ -403,12 +463,7 @@ where
     /// which never took them.
     #[must_use]
     pub fn remaining_keys(&self) -> Vec<K> {
-        let mut keys: Vec<K> = self
-            .keys
-            .iter()
-            .copied()
-            .filter(|key| self.in_degree[key.index()] != DENSE_SENTINEL)
-            .collect();
+        let mut keys = self.kahn.remaining_keys();
         keys.sort_unstable();
         keys
     }
@@ -422,10 +477,10 @@ where
         self.ready.is_empty()
     }
 
-    /// Returns an upper bound on the remaining keys.
+    /// Returns the number of keys not yielded yet.
     #[must_use]
     pub fn remaining(&self) -> usize {
-        self.remaining
+        self.kahn.remaining()
     }
 
     /// Returns `true` if the drain has stalled due to a cycle.
@@ -436,59 +491,22 @@ where
     /// This is only meaningful after the iterator has been exhausted.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        self.stalled
+        self.kahn.stalled
     }
 
     /// Returns whether the drain completed or stalled due to a cycle.
     #[must_use]
     pub fn completion(&self) -> DrainCompletion {
-        if self.stalled {
-            DrainCompletion::Stalled {
-                remaining: self.remaining(),
-            }
-        } else {
-            DrainCompletion::Complete
-        }
+        self.kahn.completion()
     }
 
     /// Collects all yielded keys and returns completion status.
     #[must_use]
     pub fn collect_with_completion(mut self) -> (Vec<K>, DrainCompletion) {
-        let mut out = Vec::with_capacity(self.remaining);
+        let mut out = Vec::with_capacity(self.kahn.remaining());
         out.extend(&mut self);
         let completion = self.completion();
         (out, completion)
-    }
-}
-
-impl<K> Drop for DrainSorted<'_, K>
-where
-    K: Copy + Eq + Hash + DenseKey,
-{
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.take() {
-            for &key in self.in_degree.keys() {
-                owner.mark(key, self.channel);
-            }
-        }
-    }
-}
-
-impl<K> Drop for DrainSortedDeterministic<'_, K>
-where
-    K: Copy + Eq + Hash + Ord + DenseKey,
-{
-    fn drop(&mut self) {
-        if self.remaining == 0 {
-            return;
-        }
-        if let Some(owner) = self.owner.take() {
-            for &key in &self.keys {
-                if self.in_degree[key.index()] != DENSE_SENTINEL {
-                    owner.mark(key, self.channel);
-                }
-            }
-        }
     }
 }
 
@@ -499,33 +517,18 @@ where
     type Item = K;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(key) = self.queue.pop_front() else {
-            if !self.in_degree.is_empty() {
-                self.stalled = true;
-            }
+        let Some(key) = self.ready.pop_front() else {
+            self.kahn.exhausted();
             return None;
         };
-
-        // Remove from in_degree to mark as processed
-        self.in_degree.remove(&key);
-
-        // Decrement in-degree of invalidated dependents
-        for dependent in self.graph.dependents(key, self.channel) {
-            if let Some(deg) = self.in_degree.get_mut(&dependent) {
-                *deg -= 1;
-                if *deg == 0 {
-                    self.queue.push_back(dependent);
-                }
-            }
-        }
-
+        self.kahn.yield_key(key, &mut self.ready);
         Some(key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Ready keys will all be yielded; blocked keys may never be, if they
         // sit on or behind a cycle.
-        (self.queue.len(), Some(self.in_degree.len()))
+        (self.ready.len(), Some(self.kahn.remaining()))
     }
 }
 
@@ -537,32 +540,17 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let Some(Reverse(key)) = self.ready.pop() else {
-            if self.remaining > 0 {
-                self.stalled = true;
-            }
+            self.kahn.exhausted();
             return None;
         };
-
-        self.in_degree[key.index()] = DENSE_SENTINEL;
-        self.remaining -= 1;
-
-        for dependent in self.graph.dependents(key, self.channel) {
-            let idx = dependent.index();
-            if idx < self.in_degree.len() && self.in_degree[idx] != DENSE_SENTINEL {
-                self.in_degree[idx] -= 1;
-                if self.in_degree[idx] == 0 {
-                    self.ready.push(Reverse(dependent));
-                }
-            }
-        }
-
+        self.kahn.yield_key(key, &mut self.ready);
         Some(key)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Ready keys will all be yielded; blocked keys may never be, if they
         // sit on or behind a cycle.
-        (self.ready.len(), Some(self.remaining))
+        (self.ready.len(), Some(self.kahn.remaining()))
     }
 }
 
@@ -757,10 +745,7 @@ mod tests {
             .unwrap();
 
         let invalidated_keys = vec![4, 2, 1, 3]; // Out of order
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // Must be in topological order
         assert_eq!(sorted, vec![1, 2, 3, 4]);
@@ -784,10 +769,7 @@ mod tests {
             .unwrap();
 
         let invalidated_keys = vec![4, 3, 2, 1];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // 1 must come first, 4 must come last, 2 and 3 can be in either order
         assert_eq!(sorted[0], 1);
@@ -809,10 +791,7 @@ mod tests {
 
         // Only 2 and 3 are invalidated (not 1)
         let invalidated_keys = vec![3, 2];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // 2 should come before 3, but 1 is not in the invalidation set
         assert_eq!(sorted, vec![2, 3]);
@@ -822,10 +801,7 @@ mod tests {
     fn no_dependencies() {
         let graph = InvalidationGraph::<u32>::new();
         let invalidated_keys = vec![3, 1, 2];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // All have in-degree 0, so order is based on iteration order (set-dependent)
         assert_eq!(sorted.len(), 3);
@@ -853,10 +829,7 @@ mod tests {
     fn empty_invalidated_set() {
         let graph = InvalidationGraph::<u32>::new();
         let invalidated_keys: Vec<u32> = vec![];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
         assert!(sorted.is_empty());
     }
 
@@ -868,9 +841,7 @@ mod tests {
             .unwrap();
 
         let invalidated_keys = vec![1, 2];
-        let cap = invalidated_keys.len();
-        let mut drain =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT);
+        let mut drain = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT);
 
         // Only 1 is ready; 2 waits on it.
         assert_eq!(drain.size_hint(), (1, Some(2)));
@@ -893,10 +864,7 @@ mod tests {
 
         // Duplicates in input
         let invalidated_keys = vec![1, 2, 1, 2, 1];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT)
-                .collect();
+        let sorted: Vec<_> = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // Should deduplicate to just [1, 2]
         assert_eq!(sorted.len(), 2);
@@ -919,9 +887,7 @@ mod tests {
 
         // All three are invalidated
         let invalidated_keys = vec![1, 2, 3];
-        let cap = invalidated_keys.len();
-        let mut drain =
-            DrainSorted::from_iter_with_capacity(invalidated_keys.into_iter(), cap, &graph, LAYOUT);
+        let mut drain = DrainSorted::from_keys(invalidated_keys, &graph, LAYOUT);
         let sorted: Vec<_> = drain.by_ref().collect();
 
         // All keys are in a cycle, so no key has in-degree 0, nothing is yielded
@@ -1141,27 +1107,41 @@ mod tests {
             .unwrap();
 
         let invalidated_keys: Vec<u32> = vec![4, 3, 2, 1];
-        let cap = invalidated_keys.len();
-        let sorted: Vec<_> = DrainSortedDeterministic::from_iter_with_capacity(
-            invalidated_keys.into_iter(),
-            cap,
-            &graph,
-            LAYOUT,
-        )
-        .collect();
+        let sorted: Vec<_> =
+            DrainSortedDeterministic::from_keys(invalidated_keys, &graph, LAYOUT).collect();
 
         // Deterministic tie-breaker yields 2 before 3.
         assert_eq!(sorted, vec![1, 2, 3, 4]);
     }
 
     #[test]
-    #[should_panic(expected = "DenseKey index")]
-    fn deterministic_drain_rejects_sparse_key_space() {
-        let graph = InvalidationGraph::<usize>::new();
+    fn drains_take_sparse_keys() {
+        // Edges among small keys, and marked keys with huge indices. The
+        // in-degree table covers only the compact keys.
+        let mut graph = InvalidationGraph::<usize>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
         let mut invalidated = InvalidationSet::new();
-        invalidated.mark(usize::MAX, LAYOUT);
+        for key in [2, 1, usize::MAX, usize::MAX / 2] {
+            invalidated.mark(key, LAYOUT);
+        }
 
-        let _: Vec<_> = drain_sorted_deterministic(&mut invalidated, &graph, LAYOUT).collect();
+        let mut drain = drain_sorted_deterministic(&mut invalidated, &graph, LAYOUT);
+        assert!(
+            drain.kahn.in_degree.table_slots() < 1024,
+            "huge keys are hashed, not given table slots"
+        );
+        let first: Vec<_> = drain.by_ref().take(2).collect();
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(drain.remaining_keys(), vec![usize::MAX / 2, usize::MAX]);
+        drop(drain);
+        assert_eq!(invalidated.len(LAYOUT), 2, "the sparse keys were put back");
+
+        let mut rest: Vec<_> = drain_sorted(&mut invalidated, &graph, LAYOUT).collect();
+        rest.sort_unstable();
+        assert_eq!(rest, vec![usize::MAX / 2, usize::MAX]);
+        assert!(!invalidated.has_invalidated(LAYOUT));
     }
 
     #[test]
