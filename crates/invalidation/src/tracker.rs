@@ -11,7 +11,9 @@ use crate::channel::{Channel, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
 use crate::drain_builder::{AnyOrder, DrainBuilder};
-use crate::graph::{CycleError, CycleHandling, InvalidationGraph};
+use crate::graph::{
+    AddDependency, CycleError, CycleHandling, DependencyChanges, InvalidationGraph,
+};
 use crate::policy::PropagationPolicy;
 use crate::scratch::TraversalScratch;
 use crate::set::InvalidationSet;
@@ -254,7 +256,7 @@ where
         from: K,
         to: K,
         channel: Channel,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<AddDependency, CycleError<K>> {
         self.graph
             .add_dependency(from, to, channel, self.cycle_handling)
     }
@@ -268,7 +270,7 @@ where
         to: K,
         channel: Channel,
         handling: CycleHandling,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<AddDependency, CycleError<K>> {
         self.graph.add_dependency(from, to, channel, handling)
     }
 
@@ -298,7 +300,7 @@ where
         from: K,
         channel: Channel,
         to: impl IntoIterator<Item = K>,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<DependencyChanges<K>, CycleError<K>> {
         self.graph
             .replace_dependencies(from, channel, to, self.cycle_handling)
     }
@@ -313,7 +315,7 @@ where
         channel: Channel,
         to: impl IntoIterator<Item = K>,
         handling: CycleHandling,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<DependencyChanges<K>, CycleError<K>> {
         self.graph.replace_dependencies(from, channel, to, handling)
     }
 
