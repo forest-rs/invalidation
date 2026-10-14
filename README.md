@@ -63,7 +63,8 @@ Runnable examples:
 - `LazyPolicy` should usually be paired with affected drains, not
   `drain_sorted`.
 - Dense deterministic drains assume a compact key space.
-- If you allow cycles, topological drains can stall.
+- If you allow cycles, topological drains can stall. The stuck keys stay
+  invalidated; `remaining_keys` on the drain names them.
 
 ## Minimum supported Rust Version (MSRV)
 

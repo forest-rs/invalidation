@@ -509,12 +509,15 @@ where
     }
 }
 
-impl<'d, 'g, 's, K> DrainBuilder<'d, 'g, 's, K, AnyOrder>
+impl<'d, 'g: 'd, 's, K> DrainBuilder<'d, 'g, 's, K, AnyOrder>
 where
     K: Copy + Eq + Hash + DenseKey,
 {
     /// Executes the drain and returns an iterator in topological order.
-    pub fn run(self) -> DrainSorted<'g, K> {
+    ///
+    /// The iterator borrows the invalidated set: keys it does not yield are
+    /// marked invalidated again when it is dropped. See [`DrainSorted`].
+    pub fn run(self) -> DrainSorted<'d, K> {
         let DrainBuilder {
             invalidated,
             graph,
@@ -561,15 +564,19 @@ where
 
         let cap = keys.len();
         DrainSorted::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
+            .returning_to(invalidated)
     }
 }
 
-impl<'d, 'g, 's, K> DrainBuilder<'d, 'g, 's, K, DeterministicOrder>
+impl<'d, 'g: 'd, 's, K> DrainBuilder<'d, 'g, 's, K, DeterministicOrder>
 where
     K: Copy + Eq + Hash + Ord + DenseKey,
 {
     /// Executes the drain and returns an iterator in deterministic topological order.
-    pub fn run(self) -> DrainSortedDeterministic<'g, K> {
+    ///
+    /// The iterator borrows the invalidated set: keys it does not yield are
+    /// marked invalidated again when it is dropped. See [`DrainSorted`].
+    pub fn run(self) -> DrainSortedDeterministic<'d, K> {
         let DrainBuilder {
             invalidated,
             graph,
@@ -617,6 +624,7 @@ where
 
         let cap = keys.len();
         DrainSortedDeterministic::from_iter_with_capacity(keys.into_iter(), cap, graph, channel)
+            .returning_to(invalidated)
     }
 }
 
