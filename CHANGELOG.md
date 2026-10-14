@@ -29,6 +29,12 @@ This release has an [MSRV][] of 1.88.
 - Added `InvalidationTracker::mark_with_trace`, which records why each
   `(key, channel)` in the closure became invalidated: the root, a dependency, a
   channel cascade, or a cross-channel edge.
+- Added summary queries: `InvalidationSet::channels` (channels with pending
+  work), `InvalidationGraph::edges`, `edge_count`, and `channels`, and
+  `CrossChannelEdges::edges` and `len`.
+- Added `ChannelNames`, a `const`-buildable table of channel names, and
+  `InvalidationTracker::set_channel_names` so the tracker's `Debug` output
+  names channels.
 - Added `InvalidationGraph::dependency_path`, a shortest chain of dependencies
   between two keys, answering "why does this key depend on that one?".
 
@@ -64,6 +70,9 @@ This release has an [MSRV][] of 1.88.
   `OneParentRecorder::explain_path` returns `(key, channel)` pairs.
   `EagerPolicy::propagate_with_trace` moved to the `PropagationPolicy` trait,
   whose default reports only the root.
+- `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
+  `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
+  edges as `from -> to`, instead of dumping 64 slots per direction.
 
 ## [0.2.0][] (2026-04-25)
 
