@@ -62,7 +62,8 @@ This release has an [MSRV][] of 1.88.
 - `InvalidationTracker::mark_with` returns a `MarkReport` with the number of
   `(key, channel)` pairs it newly invalidated and the channels they are in, so
   a caller can tell a no-op from a change without comparing the set before and
-  after.
+  after. It also counts the closure's work: how many times the policy ran, and
+  how many keys were scanned for cascades and cross-channel edges.
 - Breaking: traces now explain invalidation across channels.
   `InvalidationCause` has `Root`, `Dependency`, `Cascade`, and `CrossChannel`
   variants (`Because` became `Dependency`) and is `#[non_exhaustive]`;
