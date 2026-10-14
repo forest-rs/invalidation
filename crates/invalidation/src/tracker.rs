@@ -7,6 +7,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::hash::Hash;
 
+use crate::adaptive::PairSet;
 use crate::cascade::{CascadeCycleError, ChannelCascade};
 use crate::channel::{Channel, ChannelNames, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
@@ -124,8 +125,10 @@ pub struct MarkReport {
     /// [`PropagationPolicy::marks_all_dependents`]) the closure marks them
     /// itself, so this is all of the traversal work; with other policies it
     /// is the walk for cascades and cross-channel edges to follow, and the
-    /// policy's own traversal is not counted. `0` on the single-channel fast
-    /// path, where the policy does all the work.
+    /// policy's own traversal is not counted. `0` when the policy does all the
+    /// work: a single root with no cascades or cross-channel edges, marked
+    /// with a policy that does not mark all dependents, or marked by
+    /// [`mark_with_trace`](InvalidationTracker::mark_with_trace).
     pub keys_scanned: usize,
 }
 
@@ -700,10 +703,13 @@ where
             return report;
         };
         let second = roots.next();
+        let marks_all_dependents = policy.marks_all_dependents();
 
-        // Fast path: one root, no cascades, no cross-channel edges — pure
-        // single-channel.
+        // Fast path: one root, no cascades, no cross-channel edges, and either
+        // a policy the closure does not walk for, or a trace, whose scratch
+        // the policy's traced walk reuses: the policy does all the work.
         if second.is_none()
+            && (!marks_all_dependents || tracing.is_some())
             && self.cascade.cascades_from(channel).is_empty()
             && self.cross_channel.is_empty()
         {
@@ -739,7 +745,6 @@ where
         //
         // The worklist is first-in, first-out so that a channel's shallower
         // keys run before the deeper keys they cover.
-        let marks_all_dependents = policy.marks_all_dependents();
         let Self {
             graph,
             invalidated,
@@ -750,7 +755,7 @@ where
         let enqueue =
             |key: K,
              ch: Channel,
-             processed: &hashbrown::HashSet<(K, Channel)>,
+             processed: &PairSet<K>,
              worklist: &mut VecDeque<(K, Channel, InvalidationCause<K>)>| {
                 for_each_cross_successor(
                     cascade,
@@ -758,7 +763,7 @@ where
                     key,
                     ch,
                     |to_key, to_ch, cause| {
-                        if !processed.contains(&(to_key, to_ch)) {
+                        if !processed.contains(to_key, to_ch) {
                             worklist.push_back((to_key, to_ch, cause));
                         }
                     },
@@ -768,12 +773,12 @@ where
         for (key, channel) in core::iter::once((key, channel)).chain(second).chain(roots) {
             worklist.push_back((key, channel, InvalidationCause::Root));
         }
-        let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
-        let mut scanned = hashbrown::HashSet::<(K, Channel)>::new();
+        let mut processed = PairSet::default();
+        let mut scanned = PairSet::default();
         let mut stack: Vec<K> = Vec::new();
 
         while let Some((k, ch, cause)) = worklist.pop_front() {
-            if !processed.insert((k, ch)) {
+            if !processed.insert(k, ch) {
                 continue;
             }
 
@@ -782,14 +787,14 @@ where
                 // closure does that itself, in one walk that all steps share:
                 // a key an earlier step walked past is already marked along
                 // with everything below it, and its successors are enqueued.
-                let newly = !scanned.contains(&(k, ch));
+                let newly = !scanned.contains(k, ch);
                 if !newly {
                     if let Some((_, trace)) = tracing.as_mut() {
                         trace.record(k, ch, cause, false);
                     }
                     continue;
                 }
-                scanned.insert((k, ch));
+                scanned.insert(k, ch);
                 report.steps += 1;
                 let before = invalidated.len(ch);
                 let newly_invalidated = invalidated.mark(k, ch);
@@ -800,7 +805,7 @@ where
                 stack.push(k);
                 while let Some(current) = stack.pop() {
                     for dep in graph.dependents(current, ch) {
-                        if !scanned.insert((dep, ch)) {
+                        if !scanned.insert(dep, ch) {
                             continue;
                         }
                         report.keys_scanned += 1;
@@ -830,13 +835,13 @@ where
             // 2. Discover cross-channel targets from k and all of its
             //    transitive dependents that were actually marked.
             enqueue(k, ch, &processed, &mut worklist);
-            if !scanned.insert((k, ch)) {
+            if !scanned.insert(k, ch) {
                 continue;
             }
             stack.push(k);
             while let Some(current) = stack.pop() {
                 for dep in graph.dependents(current, ch) {
-                    if !scanned.insert((dep, ch)) {
+                    if !scanned.insert(dep, ch) {
                         continue;
                     }
                     report.keys_scanned += 1;
@@ -2184,7 +2189,15 @@ mod tests {
         tracker.add_dependency(3, 2, LAYOUT).unwrap();
         let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
         assert_eq!(report.steps, 1);
-        assert_eq!(report.keys_scanned, 0, "the fast path does not scan");
+        assert_eq!(report.keys_scanned, 2, "the closure walks 2 and 3 itself");
+
+        tracker.clear_all();
+        let report = tracker.mark_with(1, LAYOUT, &LazyPolicy);
+        assert_eq!(report.steps, 1);
+        assert_eq!(
+            report.keys_scanned, 0,
+            "lazy marks the root; nothing to walk"
+        );
 
         tracker.clear_all();
         tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
