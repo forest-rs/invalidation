@@ -19,7 +19,7 @@ use core::hash::Hash;
 
 use hashbrown::HashMap;
 
-use crate::channel::{Channel, ChannelNames};
+use crate::channel::{Channel, ChannelNames, ChannelSet};
 
 /// Sparse cross-channel dependency edges.
 ///
@@ -70,6 +70,9 @@ pub struct CrossChannelEdges<K> {
     forward: HashMap<(K, Channel), Vec<(K, Channel)>>,
     /// Reverse map: `(to_key, to_channel)` → list of `(from_key, from_channel)`.
     reverse: HashMap<(K, Channel), Vec<(K, Channel)>>,
+    /// Number of `(key, channel)` sources in `forward`, per channel, so that
+    /// whether a channel has outgoing edges is a constant-time question.
+    sources: [u32; 64],
 }
 
 impl<K> fmt::Debug for CrossChannelEdges<K>
@@ -122,6 +125,7 @@ where
         Self {
             forward: HashMap::new(),
             reverse: HashMap::new(),
+            sources: [0; 64],
         }
     }
 
@@ -135,6 +139,26 @@ where
     #[must_use]
     pub fn len(&self) -> usize {
         self.forward.values().map(Vec::len).sum()
+    }
+
+    /// Returns the channels that have at least one edge leading out of them.
+    ///
+    /// This is a constant-time query.
+    #[must_use]
+    pub fn source_channels(&self) -> ChannelSet {
+        let mut channels = ChannelSet::EMPTY;
+        for channel in ChannelSet::ALL {
+            if self.sources[channel.index() as usize] > 0 {
+                channels.insert(channel);
+            }
+        }
+        channels
+    }
+
+    /// Returns `true` if any edge leads out of `channel`.
+    #[must_use]
+    pub fn has_sources_in(&self, channel: Channel) -> bool {
+        self.sources[channel.index() as usize] > 0
     }
 
     /// Returns an iterator over every edge, as `(from, to)` pairs of
@@ -162,6 +186,9 @@ where
         let from = (from_key, from_ch);
         let to = (to_key, to_ch);
 
+        if !self.forward.contains_key(&from) {
+            self.sources[from_ch.index() as usize] += 1;
+        }
         let fwd = self.forward.entry(from).or_default();
         if fwd.contains(&to) {
             return false;
@@ -233,6 +260,7 @@ where
                 fwd.swap_remove(pos);
                 if fwd.is_empty() {
                     self.forward.remove(&from);
+                    self.sources[from_ch.index() as usize] -= 1;
                 }
                 true
             } else {
@@ -263,6 +291,7 @@ where
         let Some(targets) = self.forward.remove(&from) else {
             return false;
         };
+        self.sources[from_ch.index() as usize] -= 1;
 
         for to in targets {
             if let Some(rev) = self.reverse.get_mut(&to) {
@@ -294,6 +323,7 @@ where
                 }
                 if fwd.is_empty() {
                     self.forward.remove(&from);
+                    self.sources[from.1.index() as usize] -= 1;
                 }
             }
         }
@@ -338,6 +368,7 @@ where
 
         for fwd_key in &fwd_keys {
             if let Some(targets) = self.forward.remove(fwd_key) {
+                self.sources[fwd_key.1.index() as usize] -= 1;
                 for to in targets {
                     if let Some(rev) = self.reverse.get_mut(&to) {
                         if let Some(pos) = rev.iter().position(|e| *e == *fwd_key) {
@@ -369,6 +400,7 @@ where
                         }
                         if fwd.is_empty() {
                             self.forward.remove(&from);
+                            self.sources[from.1.index() as usize] -= 1;
                         }
                     }
                 }
@@ -510,5 +542,45 @@ mod tests {
         let edges = CrossChannelEdges::<u32>::new();
         assert_eq!(edges.dependents(1, LAYOUT).count(), 0);
         assert_eq!(edges.dependencies(1, LAYOUT).count(), 0);
+    }
+
+    #[test]
+    fn source_channels_track_every_mutation() {
+        let mut seed = 0x50_u64;
+        let mut next = |bound: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            u32::try_from(seed >> 33).unwrap() % bound
+        };
+        let ch = |i: u32| Channel::new(u8::try_from(i).unwrap());
+        let mut edges = CrossChannelEdges::<u32>::new();
+        for _ in 0..2000 {
+            let (a, b) = (next(6), next(6));
+            let (x, y) = (ch(next(3)), ch(next(3)));
+            match next(7) {
+                0 | 1 => {
+                    edges.add_edge(a, x, b, y);
+                }
+                2 => {
+                    edges.remove_edge(a, x, b, y);
+                }
+                3 => {
+                    edges.clear_dependents(a, x);
+                }
+                4 => {
+                    edges.clear_dependencies(b, y);
+                }
+                5 => {
+                    edges.replace_dependents(a, x, [(b, y), (a, y)]);
+                }
+                _ => edges.remove_key(a),
+            }
+            let mut expected = ChannelSet::EMPTY;
+            for ((_, from_ch), _) in edges.edges() {
+                expected.insert(from_ch);
+            }
+            assert_eq!(edges.source_channels(), expected);
+        }
     }
 }

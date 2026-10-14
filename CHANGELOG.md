@@ -33,6 +33,8 @@ This release has an [MSRV][] of 1.88.
   one closure, so dependents and edges that several roots reach are walked
   once. Marking 1024 roots of a 4096-key DAG and draining takes 0.54 ms this
   way, against 160 ms with a `mark_with` call per root.
+- Added `PropagationPolicy::marks_only_root` (`true` for `LazyPolicy`) and
+  `CrossChannelEdges::source_channels` / `has_sources_in`.
 - Added summary queries: `InvalidationSet::channels` (channels with pending
   work), `InvalidationGraph::edges`, `edge_count`, and `channels`, and
   `CrossChannelEdges::edges` and `len`.
@@ -125,6 +127,12 @@ This release has an [MSRV][] of 1.88.
   1 KB of heap instead of 62 KB; a lazy mark and affected drain takes 107 µs
   instead of 312 µs; building a 1024-key DAG with cycle checks takes half
   the time.
+- `mark_with` with `LazyPolicy` no longer walks the marked key's dependents
+  when cascades or cross-channel edges are configured; affected drains follow
+  those dependents' edges when they take them. Lazily marking every key of a
+  4096-key chain with a cascade took 88 ms and now takes under 0.5 ms. Marks
+  and drains in a channel with no cascades or cross-channel edges out of it
+  no longer pay for edges elsewhere.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
