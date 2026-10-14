@@ -99,6 +99,20 @@ where
         false
     }
 
+    /// Returns `true` if [`propagate`](Self::propagate) marks only its key,
+    /// as [`LazyPolicy`] does.
+    ///
+    /// When this is `true`,
+    /// [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with)
+    /// follows the cascades and cross-channel edges of the key itself and
+    /// does not walk its dependents looking for invalidated ones whose edges
+    /// to follow. The tracker's affected drains follow the edges of every key
+    /// they take, which covers those dependents when they are drained. The
+    /// default is `false`: the tracker walks the dependents of each step.
+    fn marks_only_root(&self) -> bool {
+        false
+    }
+
     /// Propagates like [`propagate`](Self::propagate), while reporting each
     /// `(key, channel)` it reaches to `trace`.
     ///
@@ -319,6 +333,10 @@ where
         // Just mark the key, no propagation
         invalidated.mark(key, channel);
     }
+
+    fn marks_only_root(&self) -> bool {
+        true
+    }
 }
 
 /// Blanket implementation for boxed policies.
@@ -339,6 +357,10 @@ where
 
     fn marks_all_dependents(&self) -> bool {
         (*self).marks_all_dependents()
+    }
+
+    fn marks_only_root(&self) -> bool {
+        (*self).marks_only_root()
     }
 
     fn propagate_with_trace(
