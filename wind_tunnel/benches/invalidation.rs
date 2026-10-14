@@ -79,6 +79,28 @@ fn build_cascade_tracker(n: u32, edges_per_node: u32, seed: u64) -> Invalidation
     tracker
 }
 
+/// `n` layout keys hanging off key 0, each with a cross-channel edge into a
+/// different point of one `n`-key paint chain. With `reversed`, the edges
+/// reach deeper points of the chain first.
+fn build_reconvergent_tracker(n: u32, reversed: bool) -> InvalidationTracker<u32> {
+    let mut tracker = InvalidationTracker::new();
+    for key in 1..=n {
+        let _ = tracker
+            .add_dependency(key, 0, LAYOUT)
+            .expect("a fan-out has no cycles");
+    }
+    for i in 1..n {
+        let _ = tracker
+            .add_dependency(n + 1 + i, n + i, PAINT)
+            .expect("a chain has no cycles");
+    }
+    for key in 1..=n {
+        let target = if reversed { 2 * n + 1 - key } else { n + key };
+        tracker.add_cross_dependency(key, LAYOUT, target, PAINT);
+    }
+    tracker
+}
+
 fn bench_cross_channel(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_channel");
     group.sample_size(10);
@@ -111,6 +133,24 @@ fn bench_cross_channel(c: &mut Criterion) {
                 );
             },
         );
+    }
+
+    for &n in &[256_u32, 4_096_u32] {
+        for reversed in [false, true] {
+            group.bench_function(
+                format!("eager_mark_reconvergent(n={n},reversed={reversed})"),
+                |b| {
+                    b.iter_batched(
+                        || build_reconvergent_tracker(n, reversed),
+                        |mut tracker| {
+                            black_box(tracker.mark_with(0, LAYOUT, &EagerPolicy));
+                            black_box(tracker);
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
     }
 
     group.finish();
