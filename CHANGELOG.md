@@ -40,6 +40,13 @@ This release has an [MSRV][] of 1.88.
 - Added `InvalidationGraph::dependency_path`, a shortest chain of dependencies
   between two keys, answering "why does this key depend on that one?".
 
+### Fixed
+
+- The sorted drains' `size_hint` claimed every remaining key as a lower bound,
+  but keys on or behind a cycle are never yielded; with a two-key cycle a drain
+  promised at least two items and yielded none. The lower bound is now the
+  number of keys ready to yield.
+
 ### Changed
 
 - Breaking: a drain no longer loses the keys it does not yield. Keys still
