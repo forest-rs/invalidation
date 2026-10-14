@@ -13,6 +13,8 @@ You can find its changes [documented below](#020-2026-04-25).
 
 ## [Unreleased]
 
+This release has an [MSRV][] of 1.88.
+
 ### Added
 
 - Added `DrainBuilder::retain_out_of_scope`. A targeted affected drain
