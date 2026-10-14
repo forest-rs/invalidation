@@ -234,7 +234,11 @@ where
     /// ```
     pub fn drain(&mut self, channel: Channel) -> DrainBuilder<'_, '_, '_, K, AnyOrder> {
         let builder = DrainBuilder::new(&mut self.invalidated, &self.graph, channel);
-        if self.cascade.is_empty() && self.cross_channel.is_empty() {
+        // Every key the drain takes is in `channel`, so only rules out of it
+        // can pass work on.
+        if self.cascade.cascades_from(channel).is_empty()
+            && !self.cross_channel.has_sources_in(channel)
+        {
             return builder;
         }
         builder.with_rules(CrossRules {
@@ -704,14 +708,16 @@ where
         };
         let second = roots.next();
         let marks_all_dependents = policy.marks_all_dependents();
+        let marks_only_root = policy.marks_only_root();
 
-        // Fast path: one root, no cascades, no cross-channel edges, and either
-        // a policy the closure does not walk for, or a trace, whose scratch
-        // the policy's traced walk reuses: the policy does all the work.
+        // Fast path: one root, no cascades or cross-channel edges out of its
+        // channel, and either a policy the closure does not walk for, or a
+        // trace, whose scratch the policy's traced walk reuses: the policy
+        // does all the work.
         if second.is_none()
             && (!marks_all_dependents || tracing.is_some())
             && self.cascade.cascades_from(channel).is_empty()
-            && self.cross_channel.is_empty()
+            && !self.cross_channel.has_sources_in(channel)
         {
             report.steps = 1;
             report.record(&mut self.invalidated, channel, |set| {
@@ -833,9 +839,11 @@ where
             });
 
             // 2. Discover cross-channel targets from k and all of its
-            //    transitive dependents that were actually marked.
+            //    transitive dependents that were actually marked. A policy
+            //    that marks only the root leaves its dependents to the
+            //    affected drains, which follow their edges.
             enqueue(k, ch, &processed, &mut worklist);
-            if !scanned.insert(k, ch) {
+            if marks_only_root || !scanned.insert(k, ch) {
                 continue;
             }
             stack.push(k);
@@ -845,8 +853,8 @@ where
                         continue;
                     }
                     report.keys_scanned += 1;
-                    // Lazy marks only the root; keys below it are followed
-                    // only if they were already invalidated.
+                    // Keys below the root are followed only if they are
+                    // invalidated.
                     if invalidated.is_invalidated(dep, ch) {
                         enqueue(dep, ch, &processed, &mut worklist);
                     }
@@ -2209,7 +2217,7 @@ mod tests {
 
     /// The closure as `mark_with` computed it before it pruned repeated walks:
     /// run the policy on every reached pair, and walk all transitive
-    /// dependents of each.
+    /// dependents of each, unless the policy marks only the root.
     fn reference_closure<P: PropagationPolicy<u32>>(
         tracker: &InvalidationTracker<u32>,
         invalidated: &mut InvalidationSet<u32>,
@@ -2236,6 +2244,10 @@ mod tests {
             }
             policy.propagate(k, ch, graph, invalidated);
             worklist.extend(successors(k, ch));
+            // A root-only policy leaves dependents' edges to the drains.
+            if policy.marks_only_root() {
+                continue;
+            }
             for dep in graph.transitive_dependents(k, ch) {
                 if invalidated.is_invalidated(dep, ch) {
                     worklist.extend(successors(dep, ch));

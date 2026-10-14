@@ -136,6 +136,21 @@ fn bench_cross_channel(c: &mut Criterion) {
     }
 
     for &n in &[256_u32, 4_096_u32] {
+        group.bench_function(format!("lazy_mark_every_key_cascade(n={n},e=4)"), |b| {
+            b.iter_batched(
+                || build_cascade_tracker(n, 4, 0xD1A7_0000_0000_0012),
+                |mut tracker| {
+                    for key in 0..n {
+                        black_box(tracker.mark_with(key, LAYOUT, &LazyPolicy));
+                    }
+                    black_box(tracker);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    for &n in &[256_u32, 4_096_u32] {
         for reversed in [false, true] {
             group.bench_function(
                 format!("eager_mark_reconvergent(n={n},reversed={reversed})"),
