@@ -50,6 +50,10 @@ This release has an [MSRV][] of 1.88.
   from one dropped because it would have created a cycle; all three used to be
   `true` or `false`. `replace_dependencies` returns `DependencyChanges`, listing
   the dependencies it added, removed, and dropped as cycles.
+- `InvalidationTracker::mark_with` returns a `MarkReport` with the number of
+  `(key, channel)` pairs it newly invalidated and the channels they are in, so
+  a caller can tell a no-op from a change without comparing the set before and
+  after.
 
 ## [0.2.0][] (2026-04-25)
 

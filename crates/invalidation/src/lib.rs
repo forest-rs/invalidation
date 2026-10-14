@@ -82,7 +82,9 @@
 //!
 //! - Use [`InvalidationTracker::mark_with`] for normal update workflows. It
 //!   applies the chosen [`PropagationPolicy`], channel cascades, and
-//!   cross-channel edges until the invalidation closure is complete.
+//!   cross-channel edges until the invalidation closure is complete, and
+//!   returns a [`MarkReport`] saying how many keys became invalidated, and in
+//!   which channels.
 //! - Use [`InvalidationTracker::mark`] only when you intentionally want a
 //!   direct mark without same-channel graph traversal or cross-channel edge
 //!   traversal. It still applies same-key channel cascades.
@@ -199,4 +201,4 @@ pub use policy::{EagerPolicy, LazyPolicy, PropagationPolicy};
 pub use scratch::TraversalScratch;
 pub use set::InvalidationSet;
 pub use trace::{InvalidationCause, InvalidationTrace, OneParentRecorder};
-pub use tracker::{DrainedChannels, InvalidationTracker};
+pub use tracker::{DrainedChannels, InvalidationTracker, MarkReport};
