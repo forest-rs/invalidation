@@ -164,7 +164,8 @@
 //!   [`drain_sorted`].
 //! - Deterministic dense drains assume a compact key space; intern sparse or
 //!   structured keys first.
-//! - If cycles are allowed, topological drains can stall.
+//! - If cycles are allowed, topological drains can stall. The stuck keys stay
+//!   invalidated; [`DrainSorted::remaining_keys`] names them.
 
 #![no_std]
 
@@ -198,4 +199,4 @@ pub use policy::{EagerPolicy, LazyPolicy, PropagationPolicy};
 pub use scratch::TraversalScratch;
 pub use set::InvalidationSet;
 pub use trace::{InvalidationCause, InvalidationTrace, OneParentRecorder};
-pub use tracker::InvalidationTracker;
+pub use tracker::{DrainedChannels, InvalidationTracker};

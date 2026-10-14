@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::hash::Hash;
 
 use crate::cascade::{CascadeCycleError, ChannelCascade};
-use crate::channel::Channel;
+use crate::channel::{Channel, ChannelSet};
 use crate::cross_channel::CrossChannelEdges;
 use crate::drain::{DenseKey, DrainSorted, DrainSortedDeterministic};
 use crate::drain_builder::{AnyOrder, DrainBuilder};
@@ -78,6 +78,17 @@ where
     cascade: ChannelCascade,
     /// Cross-channel edges connecting (key, channel) pairs.
     cross_channel: CrossChannelEdges<K>,
+}
+
+/// The result of [`InvalidationTracker::drain_channels_sorted`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrainedChannels<K> {
+    /// The drained keys in processing order, tagged with their channel.
+    pub keys: Vec<(Channel, K)>,
+    /// Channels whose drain stalled on a cycle. The keys they could not yield
+    /// are still invalidated.
+    pub stalled: ChannelSet,
 }
 
 impl<K> Default for InvalidationTracker<K>
@@ -520,13 +531,16 @@ where
     /// when processing the invalidation set, a node is only processed after all
     /// of its dependencies have been processed.
     ///
-    /// The channel is cleared eagerly when this iterator is created.
+    /// The drain takes the channel's keys when it is created, and keys it does
+    /// not yield are marked invalidated again when it is dropped, so stopping
+    /// early leaves the rest of the work pending.
     ///
     /// Note: if the dependency subgraph induced by the invalidated keys contains a
     /// cycle, the drain will stall and some keys will not be yielded. You can
     /// detect this by exhausting the iterator and checking
     /// [`DrainSorted::completion`], or by using
-    /// [`DrainSorted::collect_with_completion`].
+    /// [`DrainSorted::collect_with_completion`];
+    /// [`DrainSorted::remaining_keys`] names the stuck keys.
     ///
     /// # Example
     ///
@@ -643,9 +657,11 @@ where
     ///
     /// Within each channel, keys are yielded in topological order (like
     /// [`drain_sorted`](Self::drain_sorted)). Results are tagged with their
-    /// channel.
+    /// channel. Channels with no invalidated keys are skipped.
     ///
-    /// Channels with no invalidated keys are silently skipped.
+    /// A channel whose drain stalls on a cycle is listed in
+    /// [`DrainedChannels::stalled`], and the keys it could not yield stay
+    /// invalidated.
     ///
     /// # Example
     ///
@@ -660,17 +676,23 @@ where
     /// tracker.mark_with(1, LAYOUT, &EagerPolicy);
     /// tracker.mark(5, PAINT);
     ///
-    /// let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
-    /// assert_eq!(results, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
+    /// let drained = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+    /// assert_eq!(drained.keys, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
+    /// assert!(drained.stalled.is_empty());
     /// ```
-    pub fn drain_channels_sorted(&mut self, order: &[Channel]) -> Vec<(Channel, K)> {
-        let mut results = Vec::new();
+    pub fn drain_channels_sorted(&mut self, order: &[Channel]) -> DrainedChannels<K> {
+        let mut drained = DrainedChannels {
+            keys: Vec::new(),
+            stalled: ChannelSet::EMPTY,
+        };
         for &ch in order {
-            for key in self.drain_sorted(ch) {
-                results.push((ch, key));
+            let mut drain = self.drain_sorted(ch);
+            drained.keys.extend((&mut drain).map(|key| (ch, key)));
+            if drain.is_stalled() {
+                drained.stalled.insert(ch);
             }
         }
-        results
+        drained
     }
 
     /// Returns all transitive dependents following same-channel edges,
@@ -1240,7 +1262,7 @@ mod tests {
         tracker.mark(5, PAINT);
 
         let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
-        assert_eq!(results, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
+        assert_eq!(results.keys, vec![(LAYOUT, 1), (LAYOUT, 2), (PAINT, 5)]);
     }
 
     #[test]
@@ -1249,7 +1271,7 @@ mod tests {
         tracker.mark(1, PAINT);
 
         let results = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
-        assert_eq!(results, vec![(PAINT, 1)]);
+        assert_eq!(results.keys, vec![(PAINT, 1)]);
     }
 
     #[test]
@@ -1260,7 +1282,7 @@ mod tests {
 
         // PAINT first, then LAYOUT.
         let results = tracker.drain_channels_sorted(&[PAINT, LAYOUT]);
-        assert_eq!(results, vec![(PAINT, 2), (LAYOUT, 1)]);
+        assert_eq!(results.keys, vec![(PAINT, 2), (LAYOUT, 1)]);
     }
 
     #[test]
@@ -1499,5 +1521,33 @@ mod tests {
             !tracker.is_invalidated(10, PAINT),
             "cross-channel traversal is not defined for off-graph keys marked by a custom policy"
         );
+    }
+
+    #[test]
+    fn drain_channels_sorted_reports_stalled_channels() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Allow);
+        tracker.add_dependency(1, 2, LAYOUT).unwrap();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.mark(1, LAYOUT);
+        tracker.mark(2, LAYOUT);
+        tracker.mark(7, PAINT);
+
+        let drained = tracker.drain_channels_sorted(&[LAYOUT, PAINT]);
+        assert_eq!(drained.keys, vec![(PAINT, 7)]);
+        assert_eq!(drained.stalled, ChannelSet::from(LAYOUT));
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(2, LAYOUT));
+    }
+
+    #[test]
+    fn peek_puts_nothing_back() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.mark(2, LAYOUT);
+        // A peek never took its keys; dropping it must not mark anything.
+        tracker.peek_sorted(LAYOUT).next();
+        tracker.peek_sorted_deterministic(LAYOUT).next();
+        assert!(!tracker.is_invalidated(1, LAYOUT));
+        assert_eq!(tracker.invalidated().len(LAYOUT), 1);
     }
 }
