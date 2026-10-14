@@ -82,6 +82,46 @@ where
     cross_channel: CrossChannelEdges<K>,
 }
 
+/// What [`InvalidationTracker::mark_with`] marked.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarkReport {
+    /// How many `(key, channel)` pairs became invalidated. Pairs that were
+    /// already invalidated are not counted, so `0` means the call changed
+    /// nothing.
+    pub newly_invalidated: usize,
+    /// The channels in which at least one key became invalidated.
+    pub channels: ChannelSet,
+}
+
+impl MarkReport {
+    /// Returns `true` if no key became invalidated.
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.newly_invalidated == 0
+    }
+
+    /// Runs `mark` on `channel` and records the keys it newly invalidated.
+    fn record<K>(
+        &mut self,
+        invalidated: &mut InvalidationSet<K>,
+        channel: Channel,
+        mark: impl FnOnce(&mut InvalidationSet<K>),
+    ) where
+        K: Copy + Eq + Hash,
+    {
+        // Marking only ever adds keys, so the growth of the channel is the
+        // number of keys newly invalidated in it.
+        let before = invalidated.len(channel);
+        mark(invalidated);
+        let added = invalidated.len(channel) - before;
+        if added > 0 {
+            self.newly_invalidated += added;
+            self.channels.insert(channel);
+        }
+    }
+}
+
 /// The result of [`InvalidationTracker::drain_channels_sorted`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -462,14 +502,21 @@ where
     ///
     /// When no cascades or cross-channel edges are configured, this reduces
     /// to a single `policy.propagate()` call with no extra overhead.
-    pub fn mark_with<P>(&mut self, key: K, channel: Channel, policy: &P)
+    ///
+    /// The returned [`MarkReport`] says how many `(key, channel)` pairs became
+    /// invalidated, and in which channels.
+    pub fn mark_with<P>(&mut self, key: K, channel: Channel, policy: &P) -> MarkReport
     where
         P: PropagationPolicy<K>,
     {
+        let mut report = MarkReport::default();
+
         // Fast path: no cascades, no cross-channel edges — pure single-channel.
         if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
-            policy.propagate(key, channel, &self.graph, &mut self.invalidated);
-            return;
+            report.record(&mut self.invalidated, channel, |set| {
+                policy.propagate(key, channel, &self.graph, set);
+            });
+            return report;
         }
 
         // Slow path: unified closure across channels.
@@ -489,7 +536,9 @@ where
             }
 
             // 1. Run the propagation policy on this (key, channel).
-            policy.propagate(k, ch, &self.graph, &mut self.invalidated);
+            report.record(&mut self.invalidated, ch, |set| {
+                policy.propagate(k, ch, &self.graph, set);
+            });
 
             // 2. Discover cross-channel targets from k and all of its
             //    transitive dependents that were actually marked.
@@ -503,6 +552,8 @@ where
                 }
             }
         }
+
+        report
     }
 
     /// Returns `true` if the key is invalidated in the given channel.
@@ -1551,5 +1602,38 @@ mod tests {
         tracker.peek_sorted_deterministic(LAYOUT).next();
         assert!(!tracker.is_invalidated(1, LAYOUT));
         assert_eq!(tracker.invalidated().len(LAYOUT), 1);
+    }
+
+    #[test]
+    fn mark_with_reports_what_it_newly_invalidated() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_dependency(3, 2, LAYOUT).unwrap();
+
+        let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        assert_eq!(report.newly_invalidated, 3);
+        assert_eq!(report.channels, ChannelSet::from(LAYOUT));
+
+        let again = tracker.mark_with(2, LAYOUT, &EagerPolicy);
+        assert!(again.is_noop(), "everything was already invalidated");
+        assert!(again.channels.is_empty());
+
+        let lazy = tracker.mark_with(7, LAYOUT, &LazyPolicy);
+        assert_eq!(lazy.newly_invalidated, 1);
+    }
+
+    #[test]
+    fn mark_with_report_counts_cascades_and_cross_channel_edges() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.add_cross_dependency(2, PAINT, 9, LAYOUT);
+
+        let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
+        // (1, L), (2, L), (1, P), (2, P), (9, L), (9, P).
+        assert_eq!(report.newly_invalidated, 6);
+        let mut expected = ChannelSet::from(LAYOUT);
+        expected.insert(PAINT);
+        assert_eq!(report.channels, expected);
     }
 }
