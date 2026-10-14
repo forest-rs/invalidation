@@ -113,6 +113,11 @@ This release has an [MSRV][] of 1.88.
   instead of 172 KB; a few keys with huge indices cost a hash entry each, not
   a table reaching up to them. A deterministic drain of such keys used to
   panic.
+- `mark_with` tracks the pairs its closure visits in a table indexed by key
+  while the keys are compact, rather than hash sets, and walks an
+  `EagerPolicy` mark itself even without cascades or cross-channel edges.
+  Marking a 4096-key DAG eagerly takes 108 µs instead of 138 µs, and 256 µs
+  instead of 368 µs with a cascade, with less heap.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
