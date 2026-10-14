@@ -32,6 +32,8 @@ This release has an [MSRV][] of 1.88.
 - Added summary queries: `InvalidationSet::channels` (channels with pending
   work), `InvalidationGraph::edges`, `edge_count`, and `channels`, and
   `CrossChannelEdges::edges` and `len`.
+- Channels combine into sets with `|`: `LAYOUT | PAINT`, `set | PAINT`, and
+  `set |= PAINT`.
 - Added `ChannelNames`, a `const`-buildable table of channel names, and
   `InvalidationTracker::set_channel_names` so the tracker's `Debug` output
   names channels.
@@ -79,6 +81,9 @@ This release has an [MSRV][] of 1.88.
   `false`, `true` for `EagerPolicy`) so the tracker knows when re-running a
   policy is redundant. The closure now visits pairs breadth-first, so the
   first cause a trace records for a pair may differ from before.
+- `DrainBuilder::scratch` after `DrainBuilder::trace` replaces the scratch and
+  keeps the trace, instead of failing a debug assertion and dropping the trace
+  in release builds.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.

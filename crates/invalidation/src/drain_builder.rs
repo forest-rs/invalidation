@@ -214,13 +214,16 @@ where
     /// Reuses `scratch` for internal traversals (affected expansion, targeted
     /// dependency closure computation).
     ///
-    /// If you want tracing, prefer [`DrainBuilder::trace`], which also
-    /// configures scratch reuse.
+    /// [`DrainBuilder::trace`] also configures scratch reuse. Calling this
+    /// after it replaces the scratch and keeps the trace.
     #[must_use]
     pub fn scratch<'s2>(
         self,
         scratch: &'s2 mut TraversalScratch<K>,
-    ) -> DrainBuilder<'d, 'g, 's2, K, O> {
+    ) -> DrainBuilder<'d, 'g, 's2, K, O>
+    where
+        's: 's2,
+    {
         let DrainBuilder {
             invalidated,
             graph,
@@ -231,10 +234,6 @@ where
             trace,
             ..
         } = self;
-        debug_assert!(
-            trace.is_none(),
-            "calling `DrainBuilder::scratch` after configuring trace is not supported; call `DrainBuilder::trace` instead",
-        );
         DrainBuilder {
             invalidated,
             graph,
@@ -243,7 +242,7 @@ where
             within,
             out_of_scope,
             scratch: Some(scratch),
-            trace: None,
+            trace: trace.map(|trace| trace as &'s2 mut dyn InvalidationTrace<K>),
             _order: PhantomData,
         }
     }
@@ -955,5 +954,28 @@ mod tests {
             .run()
             .collect();
         assert_eq!(order, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn scratch_after_trace_keeps_the_trace() {
+        let mut t = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        t.add_dependency(2, 1, LAYOUT).unwrap();
+        t.mark_with(1, LAYOUT, &LazyPolicy);
+
+        let mut first = TraversalScratch::new();
+        let mut second = TraversalScratch::new();
+        let mut rec = OneParentRecorder::new();
+        let order: Vec<_> = t
+            .drain(LAYOUT)
+            .affected()
+            .trace(&mut first, &mut rec)
+            .scratch(&mut second)
+            .run()
+            .collect();
+        assert_eq!(order, vec![1, 2]);
+        assert_eq!(
+            rec.explain_path(2, LAYOUT).unwrap(),
+            vec![(1, LAYOUT), (2, LAYOUT)]
+        );
     }
 }
