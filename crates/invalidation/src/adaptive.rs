@@ -9,6 +9,7 @@ use core::hash::Hash;
 use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
 
+use crate::channel::{Channel, ChannelSet};
 use crate::drain::DenseKey;
 
 /// How many table slots each entry may account for before keys go to a hash
@@ -124,6 +125,114 @@ where
     }
 }
 
+/// A set of `(key, channel)` pairs, for a traversal whose size is not known
+/// up front.
+///
+/// Each key's channels are a [`ChannelSet`] in a table indexed by
+/// [`DenseKey::index`], while the table stays within [`table_budget`] for the
+/// keys present; other keys' channels live in a hash map. The table grows as
+/// keys arrive, and hashed keys that a grown table covers move into it, so
+/// every key is in exactly one of the two.
+pub(crate) struct PairSet<K> {
+    /// The channels of each key in the table; empty when the key is absent.
+    table: Vec<ChannelSet>,
+    hashed: HashMap<K, ChannelSet>,
+    /// The smallest index in `hashed`, so that growing the table looks for
+    /// keys to move only once it reaches one.
+    min_hashed: usize,
+    /// Number of keys with at least one channel.
+    keys: usize,
+}
+
+impl<K> Default for PairSet<K> {
+    fn default() -> Self {
+        Self {
+            table: Vec::new(),
+            hashed: HashMap::new(),
+            min_hashed: usize::MAX,
+            keys: 0,
+        }
+    }
+}
+
+impl<K> PairSet<K>
+where
+    K: Copy + Eq + Hash + DenseKey,
+{
+    /// Adds `(key, channel)`, returning `true` if it was absent.
+    pub(crate) fn insert(&mut self, key: K, channel: Channel) -> bool {
+        let idx = key.index();
+        if idx >= self.table.len() && !self.hashed.contains_key(&key) {
+            self.grow_for(idx);
+        }
+        let channels = match self.table.get_mut(idx) {
+            Some(channels) => channels,
+            None => {
+                self.min_hashed = self.min_hashed.min(idx);
+                self.hashed.entry(key).or_insert(ChannelSet::EMPTY)
+            }
+        };
+        if channels.contains(channel) {
+            return false;
+        }
+        self.keys += usize::from(channels.is_empty());
+        channels.insert(channel);
+        true
+    }
+
+    /// Returns `true` if `(key, channel)` is present.
+    pub(crate) fn contains(&self, key: K, channel: Channel) -> bool {
+        match self.table.get(key.index()) {
+            Some(channels) => channels.contains(channel),
+            None => self
+                .hashed
+                .get(&key)
+                .is_some_and(|channels| channels.contains(channel)),
+        }
+    }
+
+    /// Grows the table to cover `idx` if it stays within budget, moving
+    /// hashed keys that it then covers into it.
+    fn grow_for(&mut self, idx: usize) {
+        let budget = table_budget(self.keys + 1);
+        if idx >= budget {
+            return;
+        }
+        // Grow geometrically, within the budget, so a table filled in
+        // ascending key order is not resized for every key.
+        let new_len = idx
+            .saturating_add(1)
+            .max(self.table.len().saturating_mul(2))
+            .min(budget);
+        self.table.resize(new_len, ChannelSet::EMPTY);
+        if self.min_hashed >= new_len {
+            return;
+        }
+        let table = &mut self.table;
+        let mut min_hashed = usize::MAX;
+        self.hashed.retain(|key, channels| {
+            let idx = key.index();
+            match table.get_mut(idx) {
+                Some(slot) => {
+                    *slot = *channels;
+                    false
+                }
+                None => {
+                    min_hashed = min_hashed.min(idx);
+                    true
+                }
+            }
+        });
+        self.min_hashed = min_hashed;
+    }
+
+    /// Returns the number of table slots, for tests of memory use.
+    #[cfg(test)]
+    pub(crate) fn table_slots(&self) -> usize {
+        self.table.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +276,55 @@ mod tests {
         assert_eq!(degrees.get(3), None);
         degrees.remove(u32::MAX - 1);
         assert_eq!(degrees.len(), 0);
+    }
+
+    const A: Channel = Channel::new(0);
+    const B: Channel = Channel::new(5);
+
+    #[test]
+    fn pair_set_growth_skips_hashed_keys_out_of_reach() {
+        let mut pairs = PairSet::<u32>::default();
+        for key in 0..2000 {
+            pairs.insert((1 << 30) + key, A);
+        }
+        assert_eq!(pairs.min_hashed, 1 << 30);
+        // Compact keys grow the table again and again; none of these growths
+        // reach the hashed keys, so none of them look at them.
+        for key in 0..5000 {
+            pairs.insert(key, A);
+        }
+        assert_eq!(pairs.hashed.len(), 2000);
+        assert!(pairs.contains((1 << 30) + 1999, A));
+        assert!(pairs.contains(4999, A));
+    }
+
+    #[test]
+    fn pair_set_keeps_compact_keys_in_the_table() {
+        let mut pairs = PairSet::<u32>::default();
+        for key in 0..2000 {
+            assert!(pairs.insert(key, A));
+        }
+        assert!(pairs.insert(7, B));
+        assert!(!pairs.insert(7, B));
+        assert!(pairs.contains(7, A) && pairs.contains(7, B));
+        assert!(!pairs.contains(8, B));
+        assert!(pairs.hashed.is_empty());
+        assert!(pairs.table_slots() <= table_budget(2000));
+    }
+
+    #[test]
+    fn pair_set_hashes_sparse_keys_and_migrates_them() {
+        let mut pairs = PairSet::<u32>::default();
+        assert!(pairs.insert(1 << 30, A));
+        assert!(pairs.insert(1000, B), "too far for an empty set; hashed");
+        assert_eq!(pairs.hashed.len(), 2);
+        for key in 0..1000 {
+            pairs.insert(key, A);
+        }
+        assert!(pairs.table_slots() > 1000);
+        assert_eq!(pairs.hashed.len(), 1, "1000 moved into the table");
+        assert!(pairs.contains(1000, B) && !pairs.contains(1000, A));
+        assert!(pairs.contains(1 << 30, A));
+        assert!(pairs.table_slots() <= table_budget(1001));
     }
 }
