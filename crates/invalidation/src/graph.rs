@@ -65,13 +65,66 @@ impl<K: fmt::Debug> fmt::Display for CycleError<K> {
 
 impl<K: fmt::Debug> core::error::Error for CycleError<K> {}
 
+/// What [`InvalidationGraph::add_dependency`] did with a dependency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AddDependency {
+    /// The dependency was added.
+    Added,
+    /// The dependency already existed; the graph is unchanged.
+    AlreadyPresent,
+    /// The dependency would have created a cycle and was dropped, as
+    /// [`CycleHandling::Ignore`] (or [`CycleHandling::DebugAssert`] in release
+    /// builds) asks. A self-dependency is dropped this way even under
+    /// [`CycleHandling::Allow`]. The graph is unchanged.
+    CycleIgnored,
+}
+
+impl AddDependency {
+    /// Returns `true` if the dependency was added.
+    #[must_use]
+    pub fn is_added(self) -> bool {
+        self == Self::Added
+    }
+}
+
+/// What [`InvalidationGraph::replace_dependencies`] changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DependencyChanges<K> {
+    /// Dependencies that were added.
+    pub added: Vec<K>,
+    /// Dependencies that were removed.
+    pub removed: Vec<K>,
+    /// Requested dependencies that were dropped because they would have
+    /// created a cycle (see [`AddDependency::CycleIgnored`]).
+    pub cycles_ignored: Vec<K>,
+}
+
+impl<K> Default for DependencyChanges<K> {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+            cycles_ignored: Vec::new(),
+        }
+    }
+}
+
+impl<K> DependencyChanges<K> {
+    /// Returns `true` if the dependency set changed.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty()
+    }
+}
+
 /// How to handle cycle detection when adding dependencies.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum CycleHandling {
     /// Panic in debug builds, silently ignore in release builds.
     ///
     /// This is the default behavior: catches bugs during development and
-    /// returns `Ok(false)` in release builds if a cycle is detected.
+    /// returns `Ok(AddDependency::CycleIgnored)` in release builds if a cycle is detected.
     ///
     /// This still performs the reachability check. Use [`Allow`](Self::Allow)
     /// only when the caller guarantees acyclic input or intentionally permits
@@ -211,8 +264,10 @@ where
     ///
     /// # Returns
     ///
-    /// - `Ok(true)` if the dependency was newly added.
-    /// - `Ok(false)` if the dependency already existed.
+    /// - `Ok(AddDependency::Added)` if the dependency was newly added.
+    /// - `Ok(AddDependency::AlreadyPresent)` if the dependency already existed.
+    /// - `Ok(AddDependency::CycleIgnored)` if a cycle would be created and
+    ///   `handling` dropped the dependency.
     /// - `Err(CycleError)` if a cycle would be created and `handling` is `Error`.
     ///
     /// # See Also
@@ -225,7 +280,7 @@ where
         to: K,
         channel: Channel,
         handling: CycleHandling,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<AddDependency, CycleError<K>> {
         // Self-dependency is a trivial cycle
         if from == to {
             return self.handle_cycle(from, to, channel, handling);
@@ -244,7 +299,7 @@ where
         let fwd = &mut self.forward[ch];
         grow(fwd, from_idx);
         if fwd[from_idx].contains(&to) {
-            return Ok(false);
+            return Ok(AddDependency::AlreadyPresent);
         }
 
         // Add forward edge
@@ -262,7 +317,7 @@ where
         grow_channels(&mut self.reverse_channels, to_idx);
         self.reverse_channels[to_idx].insert(channel);
 
-        Ok(true)
+        Ok(AddDependency::Added)
     }
 
     fn handle_cycle(
@@ -271,7 +326,7 @@ where
         to: K,
         channel: Channel,
         handling: CycleHandling,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<AddDependency, CycleError<K>> {
         match handling {
             CycleHandling::DebugAssert => {
                 if cfg!(debug_assertions) {
@@ -286,7 +341,7 @@ where
                         IndexPath(&path),
                     );
                 }
-                Ok(false)
+                Ok(AddDependency::CycleIgnored)
             }
             CycleHandling::Error => Err(CycleError {
                 from,
@@ -294,7 +349,7 @@ where
                 channel,
                 path: self.cycle_path(from, to, channel),
             }),
-            CycleHandling::Ignore | CycleHandling::Allow => Ok(false),
+            CycleHandling::Ignore | CycleHandling::Allow => Ok(AddDependency::CycleIgnored),
         }
     }
 
@@ -398,8 +453,9 @@ where
     ///
     /// # Returns
     ///
-    /// - `Ok(true)` if the dependency set changed.
-    /// - `Ok(false)` if the dependency set was already equal to `to`.
+    /// - `Ok(changes)` listing the dependencies added, removed, and dropped
+    ///   because they would have created a cycle. When the set already equals
+    ///   `to`, all three are empty.
     /// - `Err(CycleError)` if a cycle would be created and `handling` is `Error`
     ///   (in which case no changes are retained).
     pub fn replace_dependencies(
@@ -408,7 +464,7 @@ where
         channel: Channel,
         to: impl IntoIterator<Item = K>,
         handling: CycleHandling,
-    ) -> Result<bool, CycleError<K>> {
+    ) -> Result<DependencyChanges<K>, CycleError<K>> {
         // Collect new deps, deduplicating.
         let mut new_set: Vec<K> = Vec::new();
         for k in to {
@@ -428,7 +484,7 @@ where
 
         let unchanged = old.len() == new_set.len() && old.iter().all(|dep| new_set.contains(dep));
         if unchanged {
-            return Ok(false);
+            return Ok(DependencyChanges::default());
         }
 
         let mut to_remove: Vec<K> = Vec::new();
@@ -455,10 +511,12 @@ where
 
         // Add new edges and roll back diff mutations on error.
         let mut added: Vec<K> = Vec::new();
+        let mut cycles_ignored: Vec<K> = Vec::new();
         for dep in to_add.iter().copied() {
             match self.add_dependency(from, dep, channel, handling) {
-                Ok(true) => added.push(dep),
-                Ok(false) => {}
+                Ok(AddDependency::Added) => added.push(dep),
+                Ok(AddDependency::AlreadyPresent) => {}
+                Ok(AddDependency::CycleIgnored) => cycles_ignored.push(dep),
                 Err(e) => {
                     for d in added {
                         let _ = self.remove_dependency(from, d, channel);
@@ -471,7 +529,11 @@ where
             }
         }
 
-        Ok(true)
+        Ok(DependencyChanges {
+            added,
+            removed,
+            cycles_ignored,
+        })
     }
 
     /// Removes a key entirely from the graph.
@@ -877,7 +939,11 @@ mod tests {
         let changed = graph
             .replace_dependencies(10, LAYOUT, [3, 4], CycleHandling::Error)
             .unwrap();
-        assert!(changed);
+        assert!(changed.changed());
+        assert_eq!(changed.added, vec![3, 4]);
+        let mut removed = changed.removed.clone();
+        removed.sort_unstable();
+        assert_eq!(removed, vec![1, 2]);
 
         let deps: Vec<_> = graph.dependencies(10, LAYOUT).collect();
         assert_eq!(deps.len(), 2);
@@ -929,7 +995,7 @@ mod tests {
         let changed = graph
             .replace_dependencies(10, LAYOUT, [2, 1, 2], CycleHandling::Error)
             .unwrap();
-        assert!(!changed);
+        assert!(!changed.changed());
 
         let deps: Vec<_> = graph.dependencies(10, LAYOUT).collect();
         assert_eq!(deps.len(), 2);
@@ -1066,8 +1132,33 @@ mod tests {
 
         // Self-cycle is silently ignored
         let result = graph.add_dependency(1, 1, LAYOUT, CycleHandling::Ignore);
-        assert!(result.is_ok());
-        assert!(!result.unwrap()); // Returns false because nothing was added
+        assert_eq!(result, Ok(AddDependency::CycleIgnored));
+    }
+
+    #[test]
+    fn add_dependency_tells_duplicates_from_ignored_cycles() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        let add = |graph: &mut InvalidationGraph<u32>, from, to| {
+            graph.add_dependency(from, to, LAYOUT, CycleHandling::Ignore)
+        };
+        assert_eq!(add(&mut graph, 2, 1), Ok(AddDependency::Added));
+        assert_eq!(add(&mut graph, 2, 1), Ok(AddDependency::AlreadyPresent));
+        assert_eq!(add(&mut graph, 1, 2), Ok(AddDependency::CycleIgnored));
+        assert_eq!(graph.dependency_path(1, 2, LAYOUT), None);
+    }
+
+    #[test]
+    fn replace_dependencies_reports_ignored_cycles() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Error)
+            .unwrap();
+        let changes = graph
+            .replace_dependencies(1, LAYOUT, [2, 3], CycleHandling::Ignore)
+            .unwrap();
+        assert_eq!(changes.added, vec![3]);
+        assert_eq!(changes.cycles_ignored, vec![2]);
+        assert!(changes.removed.is_empty());
     }
 
     #[test]
@@ -1083,8 +1174,7 @@ mod tests {
 
         // Cycle is allowed
         let result = graph.add_dependency(1, 3, LAYOUT, CycleHandling::Allow);
-        assert!(result.is_ok());
-        assert!(result.unwrap()); // Edge was added
+        assert_eq!(result, Ok(AddDependency::Added));
     }
 
     #[test]

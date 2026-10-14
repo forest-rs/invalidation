@@ -45,6 +45,11 @@ This release has an [MSRV][] of 1.88.
   Both are `#[non_exhaustive]`. With the default `CycleHandling::DebugAssert`,
   the debug-build panic now names the keys, channel, and cycle instead of only
   saying that one exists.
+- Breaking: `add_dependency` (on the graph and the tracker) returns
+  `AddDependency`, which tells a new edge from one that already existed and
+  from one dropped because it would have created a cycle; all three used to be
+  `true` or `false`. `replace_dependencies` returns `DependencyChanges`, listing
+  the dependencies it added, removed, and dropped as cycles.
 
 ## [0.2.0][] (2026-04-25)
 
