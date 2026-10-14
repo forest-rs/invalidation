@@ -36,7 +36,7 @@ use crate::DrainSortedDeterministic;
 use crate::InvalidationGraph;
 use crate::InvalidationSet;
 use crate::TraversalScratch;
-use crate::trace::InvalidationTrace;
+use crate::trace::{InvalidationCause, InvalidationTrace};
 
 /// Type-level marker for “any” drain ordering (ties are not specified).
 #[derive(Copy, Clone, Debug, Default)]
@@ -485,7 +485,7 @@ where
                 stack.push(root);
             }
             if let Some(t) = trace.as_deref_mut() {
-                t.root(root, channel, newly);
+                t.record(root, channel, InvalidationCause::Root, newly);
             }
         }
 
@@ -496,7 +496,12 @@ where
                 }
                 let newly = visited.insert(dependent);
                 if let Some(t) = trace.as_deref_mut() {
-                    t.caused_by(dependent, because, channel, newly);
+                    t.record(
+                        dependent,
+                        channel,
+                        InvalidationCause::Dependency { key: because },
+                        newly,
+                    );
                 }
                 if newly {
                     out.push(dependent);
@@ -701,7 +706,10 @@ mod tests {
             .collect();
 
         assert_eq!(order, vec![1, 2, 3]);
-        assert_eq!(rec.explain_path(3, LAYOUT).unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            rec.explain_path(3, LAYOUT).unwrap(),
+            vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)]
+        );
     }
 
     /// `a` and `b` both depend on `x`, `c` depends on `a`, and `q` depends on

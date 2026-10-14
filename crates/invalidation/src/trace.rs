@@ -7,33 +7,45 @@
 //! why a key became invalidated. For many embedders, it is useful to answer
 //! questions like: "Why is this key invalidated?".
 //!
-//! This module provides a minimal, additive hook for eager propagation:
-//! [`EagerPolicy::propagate_with_trace`](crate::EagerPolicy::propagate_with_trace),
-//! plus a small recorder, [`OneParentRecorder`], which stores **one
-//! plausible cause path** per key (a spanning forest).
+//! Operations that propagate invalidation can report what they do to an
+//! [`InvalidationTrace`]: each `(key, channel)` they reach, with its
+//! [`InvalidationCause`]. The causes cover every way invalidation travels: an
+//! explicit mark, a same-channel dependency, a channel cascade, and a
+//! cross-channel edge. The traced operations are
+//! [`InvalidationTracker::mark_with_trace`](crate::InvalidationTracker::mark_with_trace)
+//! (the full closure), [`PropagationPolicy::propagate_with_trace`](crate::PropagationPolicy::propagate_with_trace)
+//! (one channel), and affected drains with
+//! [`DrainBuilder::trace`](crate::DrainBuilder::trace).
+//!
+//! [`OneParentRecorder`] stores **one plausible cause** per `(key, channel)`
+//! (a spanning forest) and walks it back to a root.
 //!
 //! If you need “all roots / all paths”, that is a separate, explicitly-scoped
 //! feature: it can be much more expensive in both time and memory.
 //!
 //! ```
 //! use invalidation::{
-//!     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, OneParentRecorder,
-//!     TraversalScratch,
+//!     Channel, EagerPolicy, InvalidationTracker, OneParentRecorder, TraversalScratch,
 //! };
 //!
 //! const LAYOUT: Channel = Channel::new(0);
+//! const PAINT: Channel = Channel::new(1);
 //!
-//! let mut graph = InvalidationGraph::<u32>::new();
-//! graph.add_dependency(2, 1, LAYOUT, CycleHandling::Error).unwrap();
-//! graph.add_dependency(3, 2, LAYOUT, CycleHandling::Error).unwrap();
+//! let mut tracker = InvalidationTracker::<u32>::new();
+//! tracker.add_dependency(2, 1, LAYOUT).unwrap();
+//! tracker.add_cascade(LAYOUT, PAINT).unwrap();
+//! tracker.add_cross_dependency(2, PAINT, 7, LAYOUT);
 //!
-//! let mut invalidated = InvalidationSet::new();
 //! let mut scratch = TraversalScratch::new();
 //! let mut trace = OneParentRecorder::new();
+//! tracker.mark_with_trace(1, LAYOUT, &EagerPolicy, &mut scratch, &mut trace);
 //!
-//! EagerPolicy.propagate_with_trace(1, LAYOUT, &graph, &mut invalidated, &mut scratch, &mut trace);
-//!
-//! assert_eq!(trace.explain_path(3, LAYOUT), Some(vec![1, 2, 3]));
+//! // Why is 7 invalidated for layout? Layout of 1 invalidated layout of 2,
+//! // which cascaded to paint of 2, which feeds layout of 7.
+//! assert_eq!(
+//!     trace.explain_path(7, LAYOUT),
+//!     Some(vec![(1, LAYOUT), (2, LAYOUT), (2, PAINT), (7, LAYOUT)])
+//! );
 //! ```
 
 use alloc::vec::Vec;
@@ -45,44 +57,82 @@ use crate::Channel;
 
 /// The recorded cause of invalidation for a `(key, channel)` pair.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum InvalidationCause<K> {
-    /// The key was explicitly marked invalidated (a root).
+    /// The traced operation started here: the key was explicitly marked, or
+    /// was already invalidated when the operation (such as an affected drain)
+    /// began.
     Root,
-    /// The key was marked invalidated because it depends on `because`.
-    Because {
-        /// The immediate upstream key that caused this key to become invalidated.
-        because: K,
+    /// The key depends on `key` in the same channel, which was invalidated.
+    Dependency {
+        /// The dependency that caused this key to become invalidated.
+        key: K,
+    },
+    /// The same key was invalidated in `channel`, which cascades to this
+    /// channel directly or through other channels (see
+    /// [`ChannelCascade::cascades_from`](crate::ChannelCascade::cascades_from)).
+    /// A path through intermediate channels is reported as one step.
+    Cascade {
+        /// The channel the invalidation cascaded from.
+        channel: Channel,
+    },
+    /// A cross-channel edge from `(key, channel)` leads here (see
+    /// [`CrossChannelEdges`](crate::CrossChannelEdges)).
+    CrossChannel {
+        /// The key the edge comes from.
+        key: K,
+        /// The channel the edge comes from.
+        channel: Channel,
     },
 }
 
-/// A callback sink for eager propagation tracing.
-///
-/// See [`EagerPolicy::propagate_with_trace`](crate::EagerPolicy::propagate_with_trace).
-pub trait InvalidationTrace<K> {
-    /// Called for the explicit root key that was marked invalidated.
-    ///
-    /// `newly_invalidated` indicates whether the key was newly inserted into the
-    /// invalidation set, or was already invalidated.
-    fn root(&mut self, key: K, channel: Channel, newly_invalidated: bool);
-
-    /// Called when `key` is reached from `because` during propagation.
-    ///
-    /// `newly_invalidated` indicates whether `key` was newly inserted into the
-    /// invalidation set, or was already invalidated.
-    fn caused_by(&mut self, key: K, because: K, channel: Channel, newly_invalidated: bool);
+impl<K: Copy> InvalidationCause<K> {
+    /// Returns the `(key, channel)` that caused `(key, channel)` to become
+    /// invalidated, or `None` for a [`Root`](Self::Root).
+    #[must_use]
+    pub fn source(self, key: K, channel: Channel) -> Option<(K, Channel)> {
+        match self {
+            Self::Root => None,
+            Self::Dependency { key: because } => Some((because, channel)),
+            Self::Cascade { channel: from } => Some((key, from)),
+            Self::CrossChannel {
+                key: because,
+                channel: from,
+            } => Some((because, from)),
+        }
+    }
 }
 
-/// Records one parent pointer per invalidated key (a spanning forest).
+/// A sink for propagation traces.
+///
+/// Traced operations call [`record`](Self::record) for every `(key, channel)`
+/// they reach, including pairs that were already invalidated, so a recorder
+/// sees each cause the operation followed. See the [module docs](self).
+pub trait InvalidationTrace<K> {
+    /// Called when `(key, channel)` is reached because of `cause`.
+    ///
+    /// `newly_invalidated` indicates whether the pair was newly inserted into
+    /// the invalidation set, or was already invalidated.
+    fn record(
+        &mut self,
+        key: K,
+        channel: Channel,
+        cause: InvalidationCause<K>,
+        newly_invalidated: bool,
+    );
+}
+
+/// Records one cause per invalidated `(key, channel)` (a spanning forest).
 ///
 /// This stores a best-effort explanation path for *some* cause chain. When a
-/// key has multiple possible upstream causes, the first one observed wins.
+/// pair has multiple possible upstream causes, the first one observed wins.
 ///
 /// # Example
 ///
 /// ```
 /// use invalidation::{
-///     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, OneParentRecorder,
-///     TraversalScratch,
+///     Channel, CycleHandling, EagerPolicy, InvalidationCause, InvalidationGraph,
+///     InvalidationSet, OneParentRecorder, PropagationPolicy, TraversalScratch,
 /// };
 ///
 /// const LAYOUT: Channel = Channel::new(0);
@@ -97,8 +147,12 @@ pub trait InvalidationTrace<K> {
 ///
 /// EagerPolicy.propagate_with_trace(1, LAYOUT, &graph, &mut invalidated, &mut scratch, &mut trace);
 ///
-/// assert_eq!(trace.cause(1, LAYOUT), Some(invalidation::InvalidationCause::Root));
-/// assert_eq!(trace.explain_path(3, LAYOUT), Some(vec![1, 2, 3]));
+/// assert_eq!(trace.cause(1, LAYOUT), Some(InvalidationCause::Root));
+/// assert_eq!(trace.cause(3, LAYOUT), Some(InvalidationCause::Dependency { key: 2 }));
+/// assert_eq!(
+///     trace.explain_path(3, LAYOUT),
+///     Some(vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)])
+/// );
 /// ```
 #[derive(Debug, Default, Clone)]
 pub struct OneParentRecorder<K>
@@ -125,30 +179,48 @@ where
         self.causes.clear();
     }
 
+    /// Returns the number of `(key, channel)` pairs with a recorded cause.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.causes.len()
+    }
+
+    /// Returns `true` if no cause has been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.causes.is_empty()
+    }
+
     /// Returns the recorded cause for `(key, channel)`, if any.
     #[must_use]
     pub fn cause(&self, key: K, channel: Channel) -> Option<InvalidationCause<K>> {
         self.causes.get(&(key, channel)).copied()
     }
 
-    /// Returns one plausible path from an invalidated root to `key`.
+    /// Returns one plausible path from a root to `(key, channel)`.
     ///
-    /// The returned vector is ordered from root to `key` (inclusive).
+    /// The returned vector is ordered from the root to `(key, channel)`
+    /// (inclusive); consecutive entries are linked by the recorded
+    /// [`InvalidationCause`]s. It returns `None` if some pair on the way has
+    /// no recorded cause.
     #[must_use]
-    pub fn explain_path(&self, key: K, channel: Channel) -> Option<Vec<K>> {
+    pub fn explain_path(&self, key: K, channel: Channel) -> Option<Vec<(K, Channel)>> {
         let mut out = Vec::new();
-        let mut seen: HashSet<K> = HashSet::new();
+        let mut seen: HashSet<(K, Channel)> = HashSet::new();
 
-        let mut current = key;
+        let mut current = (key, channel);
         loop {
             if !seen.insert(current) {
                 return None;
             }
             out.push(current);
 
-            match self.cause(current, channel)? {
-                InvalidationCause::Root => break,
-                InvalidationCause::Because { because } => current = because,
+            match self
+                .cause(current.0, current.1)?
+                .source(current.0, current.1)
+            {
+                None => break,
+                Some(source) => current = source,
             }
         }
 
@@ -161,16 +233,14 @@ impl<K> InvalidationTrace<K> for OneParentRecorder<K>
 where
     K: Copy + Eq + Hash,
 {
-    fn root(&mut self, key: K, channel: Channel, _newly_invalidated: bool) {
-        self.causes
-            .entry((key, channel))
-            .or_insert(InvalidationCause::Root);
-    }
-
-    fn caused_by(&mut self, key: K, because: K, channel: Channel, _newly_invalidated: bool) {
-        self.causes
-            .entry((key, channel))
-            .or_insert(InvalidationCause::Because { because });
+    fn record(
+        &mut self,
+        key: K,
+        channel: Channel,
+        cause: InvalidationCause<K>,
+        _newly_invalidated: bool,
+    ) {
+        self.causes.entry((key, channel)).or_insert(cause);
     }
 }
 
@@ -179,7 +249,10 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use crate::{CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, TraversalScratch};
+    use crate::{
+        CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, PropagationPolicy,
+        TraversalScratch,
+    };
     use alloc::vec;
 
     const LAYOUT: Channel = Channel::new(0);
@@ -199,7 +272,10 @@ mod tests {
 
         EagerPolicy.propagate_with_trace(1, LAYOUT, &g, &mut invalidated, &mut scratch, &mut rec);
 
-        assert_eq!(rec.explain_path(3, LAYOUT).unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            rec.explain_path(3, LAYOUT).unwrap(),
+            vec![(1, LAYOUT), (2, LAYOUT), (3, LAYOUT)]
+        );
     }
 
     #[test]
@@ -219,6 +295,9 @@ mod tests {
         let mut rec = OneParentRecorder::new();
         EagerPolicy.propagate_with_trace(1, LAYOUT, &g, &mut invalidated, &mut scratch, &mut rec);
 
-        assert_eq!(rec.explain_path(2, LAYOUT).unwrap(), vec![1, 2]);
+        assert_eq!(
+            rec.explain_path(2, LAYOUT).unwrap(),
+            vec![(1, LAYOUT), (2, LAYOUT)]
+        );
     }
 }
