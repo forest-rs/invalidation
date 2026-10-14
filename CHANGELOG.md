@@ -107,6 +107,12 @@ This release has an [MSRV][] of 1.88.
 - `DrainBuilder::scratch` after `DrainBuilder::trace` replaces the scratch and
   keeps the trace, instead of failing a debug assertion and dropping the trace
   in release builds.
+- Drains keep in-degrees in a table indexed by key while the drained keys are
+  compact, and hash only keys too sparse for that. Draining 4096 keys with
+  `drain_sorted` takes 66 µs instead of 173 µs and peaks at 49 KB of heap
+  instead of 172 KB; a few keys with huge indices cost a hash entry each, not
+  a table reaching up to them. A deterministic drain of such keys used to
+  panic.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
