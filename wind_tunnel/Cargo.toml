@@ -14,7 +14,7 @@ invalidation.workspace = true
 [dev-dependencies]
 criterion = { default-features = false, features = [
     "cargo_bench_support",
-], version = "0.5" }
+], version = "0.8.2" }
 
 [lints]
 workspace = true
