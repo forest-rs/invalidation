@@ -3,6 +3,7 @@
 
 //! Invalidation coordinator for graph, set, cascades, and cross-channel edges.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::hash::Hash;
 
@@ -557,9 +558,18 @@ where
     /// marks exactly the graph-reachable dependents, and [`LazyPolicy`](crate::LazyPolicy)
     /// marks only the root. For custom policies, cross-channel follow-up is
     /// only defined for the root key and for graph-reachable keys on that
-    /// channel that the policy actually marked. Keys marked outside the
-    /// graph's reachability set will not have their cascade or cross-channel
-    /// edges followed automatically.
+    /// channel that are invalidated when the closure first walks past them.
+    /// The closure walks past each key once per channel, so a key that a
+    /// policy invalidates only in a later step (a policy that marks
+    /// dependents to a limited depth, say) does not have its edges followed.
+    /// Keys marked outside the graph's reachability set will not have their
+    /// cascade or cross-channel edges followed automatically either.
+    ///
+    /// The closure walks each key's dependents at most once per channel, and
+    /// with a policy whose
+    /// [`marks_all_dependents`](PropagationPolicy::marks_all_dependents) is
+    /// `true` it does not run the policy again on keys an earlier step
+    /// already covered, so its work grows with the size of the closure.
     ///
     /// When no cascades or cross-channel edges are configured, this reduces
     /// to a single `policy.propagate()` call with no extra overhead.
@@ -662,12 +672,35 @@ where
         // 2. For each key that ended up invalidated on that channel
         //    (root + dependents), check cascades and cross-channel edges.
         // 3. Enqueue any new (key, channel) pairs discovered.
-        let mut worklist: Vec<(K, Channel, InvalidationCause<K>)> = Vec::new();
-        worklist.push((key, channel, InvalidationCause::Root));
+        //
+        // `scanned` holds the pairs whose dependents step 2 has already walked.
+        // A walk visits a key's whole subtree, so a later walk can stop at a
+        // scanned key: every key below it that was invalidated then has had
+        // its successors enqueued, and with the built-in policies nothing
+        // below it becomes invalidated later except as a step of its own.
+        let marks_all_dependents = policy.marks_all_dependents();
+        //
+        // The worklist is first-in, first-out so that a channel's shallower
+        // keys run before the deeper keys they cover.
+        let mut worklist: VecDeque<(K, Channel, InvalidationCause<K>)> = VecDeque::new();
+        worklist.push_back((key, channel, InvalidationCause::Root));
         let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
+        let mut scanned = hashbrown::HashSet::<(K, Channel)>::new();
+        let mut stack: Vec<K> = Vec::new();
 
-        while let Some((k, ch, cause)) = worklist.pop() {
+        while let Some((k, ch, cause)) = worklist.pop_front() {
             if !processed.insert((k, ch)) {
+                continue;
+            }
+
+            // A scanned key under a policy that marks all dependents was
+            // marked, along with everything below it, by an earlier step, and
+            // that step's walk enqueued their successors. Running the policy
+            // again would only re-walk them.
+            if marks_all_dependents && scanned.contains(&(k, ch)) {
+                if let Some((_, trace)) = tracing.as_mut() {
+                    trace.record(k, ch, cause, false);
+                }
                 continue;
             }
 
@@ -680,13 +713,21 @@ where
             // 2. Discover cross-channel targets from k and all of its
             //    transitive dependents that were actually marked.
             self.enqueue_cross_successors(k, ch, &processed, &mut worklist);
-
-            // Enqueue targets for each transitive dependent of k on ch
-            // that was actually marked (eager marks them, lazy does not).
-            for dep in self.graph.transitive_dependents(k, ch) {
-                report.keys_scanned += 1;
-                if self.invalidated.is_invalidated(dep, ch) {
-                    self.enqueue_cross_successors(dep, ch, &processed, &mut worklist);
+            if !scanned.insert((k, ch)) {
+                continue;
+            }
+            stack.push(k);
+            while let Some(current) = stack.pop() {
+                for dep in self.graph.dependents(current, ch) {
+                    if !scanned.insert((dep, ch)) {
+                        continue;
+                    }
+                    report.keys_scanned += 1;
+                    // Eager marks every dependent, lazy only the root.
+                    if self.invalidated.is_invalidated(dep, ch) {
+                        self.enqueue_cross_successors(dep, ch, &processed, &mut worklist);
+                    }
+                    stack.push(dep);
                 }
             }
         }
@@ -957,11 +998,11 @@ where
         key: K,
         channel: Channel,
         processed: &hashbrown::HashSet<(K, Channel)>,
-        worklist: &mut Vec<(K, Channel, InvalidationCause<K>)>,
+        worklist: &mut VecDeque<(K, Channel, InvalidationCause<K>)>,
     ) {
         self.for_each_cross_successor(key, channel, |to_key, to_ch, cause| {
             if !processed.contains(&(to_key, to_ch)) {
-                worklist.push((to_key, to_ch, cause));
+                worklist.push_back((to_key, to_ch, cause));
             }
         });
     }
@@ -2012,5 +2053,119 @@ mod tests {
         // (1, LAYOUT) and (1, PAINT); the layout step scans 2 and 3.
         assert_eq!(report.policy_runs, 2);
         assert_eq!(report.keys_scanned, 2);
+    }
+
+    /// The closure as `mark_with` computed it before it pruned repeated walks:
+    /// run the policy on every reached pair, and walk all transitive
+    /// dependents of each.
+    fn reference_closure<P: PropagationPolicy<u32>>(
+        tracker: &InvalidationTracker<u32>,
+        invalidated: &mut InvalidationSet<u32>,
+        key: u32,
+        channel: Channel,
+        policy: &P,
+    ) {
+        let graph = tracker.graph();
+        let successors = |k: u32, ch: Channel| {
+            let mut out: Vec<(u32, Channel)> = tracker
+                .cascade()
+                .cascades_from(ch)
+                .iter()
+                .map(|c| (k, c))
+                .collect();
+            out.extend(tracker.cross_channel().dependents(k, ch));
+            out
+        };
+        let mut worklist = vec![(key, channel)];
+        let mut processed = hashbrown::HashSet::new();
+        while let Some((k, ch)) = worklist.pop() {
+            if !processed.insert((k, ch)) {
+                continue;
+            }
+            policy.propagate(k, ch, graph, invalidated);
+            worklist.extend(successors(k, ch));
+            for dep in graph.transitive_dependents(k, ch) {
+                if invalidated.is_invalidated(dep, ch) {
+                    worklist.extend(successors(dep, ch));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_closure_matches_reference_on_random_graphs() {
+        let mut seed = 0x5EED_u64;
+        let mut next = |bound: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            u32::try_from(seed >> 33).unwrap() % bound
+        };
+        let channels = [LAYOUT, PAINT, Channel::new(2)];
+
+        for case in 0..300 {
+            let n = 2 + next(24);
+            let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Allow);
+            for ch in channels {
+                for _ in 0..next(3 * n) {
+                    let _ = tracker.add_dependency(next(n), next(n), ch).unwrap();
+                }
+            }
+            for _ in 0..next(3) {
+                let (a, b) = (next(3) as usize, next(3) as usize);
+                if a < b {
+                    let _ = tracker.add_cascade(channels[a], channels[b]);
+                }
+            }
+            for _ in 0..next(6) {
+                tracker.add_cross_dependency(
+                    next(n),
+                    channels[next(3) as usize],
+                    next(n),
+                    channels[next(3) as usize],
+                );
+            }
+            for _ in 0..next(4) {
+                tracker.mark(next(n), channels[next(3) as usize]);
+            }
+            let (root, root_ch) = (next(n), channels[next(3) as usize]);
+
+            for eager in [true, false] {
+                let mut expected = tracker.invalidated().clone();
+                let mut actual = tracker.clone();
+                if eager {
+                    reference_closure(&tracker, &mut expected, root, root_ch, &EagerPolicy);
+                    actual.mark_with(root, root_ch, &EagerPolicy);
+                } else {
+                    reference_closure(&tracker, &mut expected, root, root_ch, &LazyPolicy);
+                    actual.mark_with(root, root_ch, &LazyPolicy);
+                }
+                for ch in channels {
+                    let mut want: Vec<_> = expected.iter(ch).collect();
+                    let mut got: Vec<_> = actual.invalidated().iter(ch).collect();
+                    want.sort_unstable();
+                    got.sort_unstable();
+                    assert_eq!(got, want, "case {case}, eager {eager}, channel {ch:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eager_cascade_closure_does_linear_work() {
+        let n = 512;
+        let mut tracker = InvalidationTracker::<u32>::new();
+        for i in 1..n {
+            tracker.add_dependency(i, i - 1, LAYOUT).unwrap();
+            tracker.add_dependency(i, i - 1, PAINT).unwrap();
+        }
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+
+        let report = tracker.mark_with(0, LAYOUT, &EagerPolicy);
+        assert_eq!(report.newly_invalidated, 2 * n as usize);
+        // Each key's dependents are walked once per channel, and the policy
+        // does not re-run on keys an earlier step covered.
+        assert!(report.keys_scanned < 2 * n as usize, "{report:?}");
+        assert!(report.policy_runs <= 2, "{report:?}");
     }
 }
