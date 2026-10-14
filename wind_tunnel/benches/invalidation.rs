@@ -12,6 +12,7 @@ use invalidation::{
 };
 
 const LAYOUT: Channel = Channel::new(0);
+const PAINT: Channel = Channel::new(1);
 
 #[derive(Clone)]
 struct Lcg(u64);
@@ -60,6 +61,59 @@ fn build_dag_graph(n: u32, edges_per_node: u32, seed: u64) -> InvalidationGraph<
 fn build_dag_tracker(n: u32, edges_per_node: u32, seed: u64) -> InvalidationTracker<u32> {
     let graph = build_dag_graph(n, edges_per_node, seed);
     InvalidationTracker::from_graph(graph)
+}
+
+/// A DAG with the same edges in layout and paint, and layout cascading to
+/// paint: the common "relayout means repaint" setup.
+fn build_cascade_tracker(n: u32, edges_per_node: u32, seed: u64) -> InvalidationTracker<u32> {
+    let layout = build_dag_graph(n, edges_per_node, seed);
+    let mut tracker = InvalidationTracker::from_graph(layout.clone());
+    for (from, to) in layout.edges(LAYOUT) {
+        let _ = tracker
+            .add_dependency_with(from, to, PAINT, CycleHandling::Allow)
+            .expect("CycleHandling::Allow never errors");
+    }
+    tracker
+        .add_cascade(LAYOUT, PAINT)
+        .expect("one cascade cannot form a cycle");
+    tracker
+}
+
+fn bench_cross_channel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cross_channel");
+    group.sample_size(10);
+
+    for &(n, edges_per_node) in &[(256_u32, 4_u32), (4_096_u32, 4_u32)] {
+        group.bench_function(
+            format!("eager_mark_cascade(n={n},e={edges_per_node})"),
+            |b| {
+                b.iter_batched(
+                    || build_cascade_tracker(n, edges_per_node, 0xD1A7_0000_0000_0010),
+                    |mut tracker| {
+                        black_box(tracker.mark_with(0, LAYOUT, &EagerPolicy));
+                        black_box(tracker);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_function(
+            format!("lazy_mark_cascade(n={n},e={edges_per_node})"),
+            |b| {
+                b.iter_batched(
+                    || build_cascade_tracker(n, edges_per_node, 0xD1A7_0000_0000_0011),
+                    |mut tracker| {
+                        black_box(tracker.mark_with(0, LAYOUT, &LazyPolicy));
+                        black_box(tracker);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
 }
 
 fn roots_repeating(unique_roots: u32, marks: u32) -> impl Iterator<Item = u32> {
@@ -291,5 +345,5 @@ fn bench_invalidation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_invalidation);
+criterion_group!(benches, bench_invalidation, bench_cross_channel);
 criterion_main!(benches);
