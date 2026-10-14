@@ -57,7 +57,10 @@ where
     /// The policy is responsible for marking `key` itself and any dependents
     /// it determines should become invalidated. Both built-in policies
     /// ([`EagerPolicy`], [`LazyPolicy`]) mark the root key; custom
-    /// implementations should do the same.
+    /// implementations should do the same. A policy only adds keys: it must
+    /// not take or clear any, since
+    /// [`MarkReport`](crate::MarkReport) counts the keys it added by how much
+    /// the channel grew.
     ///
     /// This trait does not directly control cross-channel traversal. In
     /// [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with),
@@ -78,14 +81,20 @@ where
         invalidated: &mut InvalidationSet<K>,
     );
 
-    /// Returns `true` if [`propagate`](Self::propagate) always marks every
-    /// transitive dependent of its key, as [`EagerPolicy`] does.
+    /// Returns `true` if [`propagate`](Self::propagate) marks exactly its key
+    /// and every transitive dependent of it, as [`EagerPolicy`] does.
     ///
+    /// When this is `true`,
     /// [`InvalidationTracker::mark_with`](crate::InvalidationTracker::mark_with)
-    /// uses this to skip running the policy again on a key whose dependents an
-    /// earlier run already marked; without it, marking through cascades or
-    /// cross-channel edges re-walks the same dependents once per key. The
-    /// default is `false`, which is always correct.
+    /// does that marking itself while it follows cascades and cross-channel
+    /// edges, in one walk shared by every step, instead of calling the policy
+    /// once per step and re-walking dependents an earlier step covered. A
+    /// policy that returns `true` but marks anything else gets the eager
+    /// result there, not its own. With the default, `false`, the tracker runs
+    /// the policy for each step of the closure, and follows the cascades and
+    /// cross-channel edges of the keys that are invalidated when its walk
+    /// first reaches them (see
+    /// [`mark_with`](crate::InvalidationTracker::mark_with)).
     fn marks_all_dependents(&self) -> bool {
         false
     }

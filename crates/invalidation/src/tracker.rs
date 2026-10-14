@@ -115,14 +115,17 @@ pub struct MarkReport {
     pub newly_invalidated: usize,
     /// The channels in which at least one key became invalidated.
     pub channels: ChannelSet,
-    /// How many times the propagation policy ran: once per `(key, channel)`
-    /// pair the closure reached. `1` when no cascade or cross-channel edge
-    /// was followed.
-    pub policy_runs: usize,
-    /// How many keys the closure visited, after running the policy, while
-    /// looking for cascades and cross-channel edges to follow. `0` on the
-    /// single-channel fast path. This is the closure's own traversal work;
-    /// the policy's traversals are not counted.
+    /// How many `(key, channel)` pairs the closure propagated from: the root,
+    /// and each cascade or cross-channel target not already covered by an
+    /// earlier step. `1` when no cascade or cross-channel edge was followed.
+    pub steps: usize,
+    /// How many dependents the closure walked, across all steps. With a
+    /// policy that marks all dependents (see
+    /// [`PropagationPolicy::marks_all_dependents`]) the closure marks them
+    /// itself, so this is all of the traversal work; with other policies it
+    /// is the walk for cascades and cross-channel edges to follow, and the
+    /// policy's own traversal is not counted. `0` on the single-channel fast
+    /// path, where the policy does all the work.
     pub keys_scanned: usize,
 }
 
@@ -146,7 +149,11 @@ impl MarkReport {
         // number of keys newly invalidated in it.
         let before = invalidated.len(channel);
         mark(invalidated);
-        let added = invalidated.len(channel) - before;
+        self.add(channel, invalidated.len(channel).saturating_sub(before));
+    }
+
+    /// Records `added` keys newly invalidated in `channel`.
+    fn add(&mut self, channel: Channel, added: usize) {
         if added > 0 {
             self.newly_invalidated += added;
             self.channels.insert(channel);
@@ -656,7 +663,7 @@ where
 
         // Fast path: no cascades, no cross-channel edges — pure single-channel.
         if self.cascade.cascades_from(channel).is_empty() && self.cross_channel.is_empty() {
-            report.policy_runs = 1;
+            report.steps = 1;
             report.record(&mut self.invalidated, channel, |set| {
                 run_policy(
                     policy,
@@ -675,20 +682,44 @@ where
         //
         // Worklist of (key, channel) pairs to propagate, with the cause that
         // reached them. For each pair we:
-        // 1. Run the policy (same-channel propagation).
+        // 1. Mark it and its dependents in its channel.
         // 2. For each key that ended up invalidated on that channel
         //    (root + dependents), check cascades and cross-channel edges.
         // 3. Enqueue any new (key, channel) pairs discovered.
         //
-        // `scanned` holds the pairs whose dependents step 2 has already walked.
+        // `scanned` holds the pairs whose dependents have already been walked.
         // A walk visits a key's whole subtree, so a later walk can stop at a
         // scanned key: every key below it that was invalidated then has had
         // its successors enqueued, and with the built-in policies nothing
         // below it becomes invalidated later except as a step of its own.
-        let marks_all_dependents = policy.marks_all_dependents();
         //
         // The worklist is first-in, first-out so that a channel's shallower
         // keys run before the deeper keys they cover.
+        let marks_all_dependents = policy.marks_all_dependents();
+        let Self {
+            graph,
+            invalidated,
+            cascade,
+            cross_channel,
+            ..
+        } = self;
+        let enqueue =
+            |key: K,
+             ch: Channel,
+             processed: &hashbrown::HashSet<(K, Channel)>,
+             worklist: &mut VecDeque<(K, Channel, InvalidationCause<K>)>| {
+                for_each_cross_successor(
+                    cascade,
+                    cross_channel,
+                    key,
+                    ch,
+                    |to_key, to_ch, cause| {
+                        if !processed.contains(&(to_key, to_ch)) {
+                            worklist.push_back((to_key, to_ch, cause));
+                        }
+                    },
+                );
+            };
         let mut worklist: VecDeque<(K, Channel, InvalidationCause<K>)> = VecDeque::new();
         worklist.push_back((key, channel, InvalidationCause::Root));
         let mut processed = hashbrown::HashSet::<(K, Channel)>::new();
@@ -700,39 +731,73 @@ where
                 continue;
             }
 
-            // A scanned key under a policy that marks all dependents was
-            // marked, along with everything below it, by an earlier step, and
-            // that step's walk enqueued their successors. Running the policy
-            // again would only re-walk them.
-            if marks_all_dependents && scanned.contains(&(k, ch)) {
-                if let Some((_, trace)) = tracing.as_mut() {
-                    trace.record(k, ch, cause, false);
+            if marks_all_dependents {
+                // The policy would mark the key and every dependent, so the
+                // closure does that itself, in one walk that all steps share:
+                // a key an earlier step walked past is already marked along
+                // with everything below it, and its successors are enqueued.
+                let newly = !scanned.contains(&(k, ch));
+                if !newly {
+                    if let Some((_, trace)) = tracing.as_mut() {
+                        trace.record(k, ch, cause, false);
+                    }
+                    continue;
                 }
+                scanned.insert((k, ch));
+                report.steps += 1;
+                let before = invalidated.len(ch);
+                let newly_invalidated = invalidated.mark(k, ch);
+                if let Some((_, trace)) = tracing.as_mut() {
+                    trace.record(k, ch, cause, newly_invalidated);
+                }
+                enqueue(k, ch, &processed, &mut worklist);
+                stack.push(k);
+                while let Some(current) = stack.pop() {
+                    for dep in graph.dependents(current, ch) {
+                        if !scanned.insert((dep, ch)) {
+                            continue;
+                        }
+                        report.keys_scanned += 1;
+                        let newly_invalidated = invalidated.mark(dep, ch);
+                        if let Some((_, trace)) = tracing.as_mut() {
+                            trace.record(
+                                dep,
+                                ch,
+                                InvalidationCause::Dependency { key: current },
+                                newly_invalidated,
+                            );
+                        }
+                        enqueue(dep, ch, &processed, &mut worklist);
+                        stack.push(dep);
+                    }
+                }
+                report.add(ch, invalidated.len(ch).saturating_sub(before));
                 continue;
             }
 
             // 1. Run the propagation policy on this (key, channel).
-            report.policy_runs += 1;
-            report.record(&mut self.invalidated, ch, |set| {
-                run_policy(policy, k, ch, cause, &self.graph, set, tracing.as_mut());
+            report.steps += 1;
+            report.record(invalidated, ch, |set| {
+                run_policy(policy, k, ch, cause, graph, set, tracing.as_mut());
             });
 
             // 2. Discover cross-channel targets from k and all of its
             //    transitive dependents that were actually marked.
-            self.enqueue_cross_successors(k, ch, &processed, &mut worklist);
+            enqueue(k, ch, &processed, &mut worklist);
             if !scanned.insert((k, ch)) {
                 continue;
             }
             stack.push(k);
             while let Some(current) = stack.pop() {
-                for dep in self.graph.dependents(current, ch) {
+                for dep in graph.dependents(current, ch) {
                     if !scanned.insert((dep, ch)) {
                         continue;
                     }
                     report.keys_scanned += 1;
-                    // Eager marks every dependent, lazy only the root.
-                    if self.invalidated.is_invalidated(dep, ch) {
-                        self.enqueue_cross_successors(dep, ch, &processed, &mut worklist);
+                    // Lazy marks only the root; keys below it are followed
+                    // only if they were already invalidated.
+                    if invalidated.is_invalidated(dep, ch) {
+                        enqueue(dep, ch, &processed, &mut worklist);
                     }
                     stack.push(dep);
                 }
@@ -983,35 +1048,33 @@ where
         &self,
         key: K,
         channel: Channel,
-        mut f: impl FnMut(K, Channel, InvalidationCause<K>),
+        f: impl FnMut(K, Channel, InvalidationCause<K>),
     ) {
-        for cascade_ch in self.cascade.cascades_from(channel) {
-            f(key, cascade_ch, InvalidationCause::Cascade { channel });
-        }
+        for_each_cross_successor(&self.cascade, &self.cross_channel, key, channel, f);
+    }
+}
 
-        for (to_key, to_ch) in self.cross_channel.dependents(key, channel) {
-            f(
-                to_key,
-                to_ch,
-                InvalidationCause::CrossChannel { key, channel },
-            );
-        }
+/// Calls `f` for each cascade or cross-channel successor of `(key, channel)`,
+/// with the cause that leads to it.
+fn for_each_cross_successor<K>(
+    cascade: &ChannelCascade,
+    cross_channel: &CrossChannelEdges<K>,
+    key: K,
+    channel: Channel,
+    mut f: impl FnMut(K, Channel, InvalidationCause<K>),
+) where
+    K: Copy + Eq + Hash,
+{
+    for cascade_ch in cascade.cascades_from(channel) {
+        f(key, cascade_ch, InvalidationCause::Cascade { channel });
     }
 
-    /// Enqueues cascade and cross-channel successors for `mark_with`, skipping
-    /// pairs that have already run the propagation policy.
-    fn enqueue_cross_successors(
-        &self,
-        key: K,
-        channel: Channel,
-        processed: &hashbrown::HashSet<(K, Channel)>,
-        worklist: &mut VecDeque<(K, Channel, InvalidationCause<K>)>,
-    ) {
-        self.for_each_cross_successor(key, channel, |to_key, to_ch, cause| {
-            if !processed.contains(&(to_key, to_ch)) {
-                worklist.push_back((to_key, to_ch, cause));
-            }
-        });
+    for (to_key, to_ch) in cross_channel.dependents(key, channel) {
+        f(
+            to_key,
+            to_ch,
+            InvalidationCause::CrossChannel { key, channel },
+        );
     }
 }
 
@@ -1974,6 +2037,33 @@ mod tests {
     }
 
     #[test]
+    fn mark_report_survives_a_policy_that_removes_keys() {
+        // Breaks the contract (policies only add keys), but must not panic.
+        struct Taking;
+        impl PropagationPolicy<u32> for Taking {
+            fn propagate(
+                &self,
+                key: u32,
+                channel: Channel,
+                _graph: &InvalidationGraph<u32>,
+                invalidated: &mut InvalidationSet<u32>,
+            ) {
+                invalidated.clear(channel);
+                invalidated.mark(key, channel);
+            }
+        }
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.mark(5, LAYOUT);
+        tracker.mark(6, LAYOUT);
+        let report = tracker.mark_with(1, LAYOUT, &Taking);
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        // Each step cleared its channel before marking, so neither grew.
+        assert_eq!(report.newly_invalidated, 0);
+        assert!(report.channels.is_empty());
+    }
+
+    #[test]
     fn custom_policy_trace_defaults_to_reporting_the_root() {
         use crate::trace::{InvalidationCause, OneParentRecorder};
 
@@ -2051,14 +2141,14 @@ mod tests {
         tracker.add_dependency(2, 1, LAYOUT).unwrap();
         tracker.add_dependency(3, 2, LAYOUT).unwrap();
         let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
-        assert_eq!(report.policy_runs, 1);
+        assert_eq!(report.steps, 1);
         assert_eq!(report.keys_scanned, 0, "the fast path does not scan");
 
         tracker.clear_all();
         tracker.add_cross_dependency(1, LAYOUT, 1, PAINT);
         let report = tracker.mark_with(1, LAYOUT, &EagerPolicy);
         // (1, LAYOUT) and (1, PAINT); the layout step scans 2 and 3.
-        assert_eq!(report.policy_runs, 2);
+        assert_eq!(report.steps, 2);
         assert_eq!(report.keys_scanned, 2);
     }
 
@@ -2173,7 +2263,7 @@ mod tests {
         // Each key's dependents are walked once per channel, and the policy
         // does not re-run on keys an earlier step covered.
         assert!(report.keys_scanned < 2 * n as usize, "{report:?}");
-        assert!(report.policy_runs <= 2, "{report:?}");
+        assert!(report.steps <= 2, "{report:?}");
     }
 
     #[test]
@@ -2305,5 +2395,26 @@ mod tests {
             trace.explain_path(2, PAINT),
             Some(vec![(1, LAYOUT), (2, LAYOUT), (2, PAINT)])
         );
+    }
+
+    #[test]
+    fn reconvergent_cross_channel_marks_do_linear_work() {
+        // n layout keys feed one n-key paint chain, deepest point first.
+        let n = 256_u32;
+        let mut tracker = InvalidationTracker::<u32>::new();
+        for key in 1..=n {
+            tracker.add_dependency(key, 0, LAYOUT).unwrap();
+        }
+        for i in 1..n {
+            tracker.add_dependency(n + 1 + i, n + i, PAINT).unwrap();
+        }
+        for key in 1..=n {
+            tracker.add_cross_dependency(key, LAYOUT, 2 * n + 1 - key, PAINT);
+        }
+
+        let report = tracker.mark_with(0, LAYOUT, &EagerPolicy);
+        assert_eq!(report.newly_invalidated, 2 * n as usize + 1);
+        // Every dependent is walked once in all, whatever order the steps run.
+        assert!(report.keys_scanned <= 2 * n as usize, "{report:?}");
     }
 }

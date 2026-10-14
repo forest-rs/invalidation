@@ -78,8 +78,8 @@ This release has an [MSRV][] of 1.88.
 - `InvalidationTracker::mark_with` returns a `MarkReport` with the number of
   `(key, channel)` pairs it newly invalidated and the channels they are in, so
   a caller can tell a no-op from a change without comparing the set before and
-  after. It also counts the closure's work: how many times the policy ran, and
-  how many keys were scanned for cascades and cross-channel edges.
+  after. It also counts the closure's work: the steps it propagated from, and
+  the dependents it walked.
 - Breaking: traces now explain invalidation across channels.
   `InvalidationCause` has `Root`, `Dependency`, `Cascade`, and `CrossChannel`
   variants (`Because` became `Dependency`) and is `#[non_exhaustive]`;
@@ -92,9 +92,14 @@ This release has an [MSRV][] of 1.88.
   re-ran `EagerPolicy` on keys an earlier step had already covered; marking the
   head of a 4096-key DAG with a layout-to-paint cascade took 124 ms and now
   takes under 1 ms. `PropagationPolicy` gains `marks_all_dependents` (default
-  `false`, `true` for `EagerPolicy`) so the tracker knows when re-running a
-  policy is redundant. The closure now visits pairs breadth-first, so the
-  first cause a trace records for a pair may differ from before.
+  `false`, `true` for `EagerPolicy`); when it is true the tracker marks the
+  dependents itself, in one walk shared by every step of the closure, so
+  cross-channel edges that reconverge on a shared tail no longer re-walk it
+  once per edge. The closure now takes its steps first-in, first-out, so the
+  first cause a trace records for a pair may differ from before. With a
+  custom policy that marks some dependents, the closure follows the edges of
+  keys that are invalidated when its walk first reaches them; a key such a
+  policy invalidates only in a later step no longer has its edges followed.
 - `DrainBuilder::scratch` after `DrainBuilder::trace` replaces the scratch and
   keeps the trace, instead of failing a debug assertion and dropping the trace
   in release builds.
