@@ -77,11 +77,18 @@ fn main() {
         "arrange drains expand from the changed node to same-channel dependents"
     );
 
+    // Arranging the label cascades to its surface and paint too: the arrange
+    // drain passed that work on as it expanded to the label.
+    assert!(
+        tracker.is_invalidated(LABEL, PAINT),
+        "the label's arrange change should cascade to its paint"
+    );
+
     let surface_work: Vec<_> = tracker.drain(SURFACE).deterministic().run().collect();
     assert_eq!(
         surface_work,
-        vec![BUTTON, TOOLTIP],
-        "surface work includes the cascaded button and anchored tooltip"
+        vec![BUTTON, LABEL, TOOLTIP],
+        "surface work includes the cascaded button and label and the anchored tooltip"
     );
 
     println!("arrange work: {arrange_work:?}");
