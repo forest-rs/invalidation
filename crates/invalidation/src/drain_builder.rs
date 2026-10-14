@@ -437,8 +437,9 @@ where
     fn is_allowed(within: &Within<'d, K>, key: K, allowed: Option<&KeySet<K>>) -> bool {
         match *within {
             Within::All => true,
-            Within::Keys(keys) => keys.contains(&key),
-            Within::DependenciesOf(_) => allowed.is_some_and(|set| set.contains(key)),
+            Within::Keys(_) | Within::DependenciesOf(_) => {
+                allowed.is_some_and(|set| set.contains(key))
+            }
         }
     }
 
@@ -658,7 +659,16 @@ where
                     Self::compute_allowed_dependencies(graph, channel, key, scratch.as_deref_mut());
                 Some(&allowed_set_storage)
             }
-            Within::All | Within::Keys(_) => None,
+            Within::Keys(keys) => {
+                // A set, so that checking the scope does not scan the slice.
+                let mut set = KeySet::default();
+                for &key in keys {
+                    set.insert(key);
+                }
+                allowed_set_storage = set;
+                Some(&allowed_set_storage)
+            }
+            Within::All => None,
         };
 
         let roots = Self::take_roots(invalidated, channel, &within, allowed);
