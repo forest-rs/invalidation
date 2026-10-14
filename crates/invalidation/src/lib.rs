@@ -87,6 +87,8 @@
 //!   which channels. [`InvalidationTracker::mark_with_trace`] does the same
 //!   while recording why each `(key, channel)` became invalidated; see
 //!   [`trace`].
+//! - Use [`InvalidationTracker::mark_many_with`] when several keys changed
+//!   at once: it marks them as one closure, so work they share is done once.
 //! - Use [`InvalidationTracker::mark`] only when you intentionally want a
 //!   direct mark without same-channel graph traversal or cross-channel edge
 //!   traversal. It still applies same-key channel cascades.
