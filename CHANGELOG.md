@@ -71,6 +71,14 @@ This release has an [MSRV][] of 1.88.
   `OneParentRecorder::explain_path` returns `(key, channel)` pairs.
   `EagerPolicy::propagate_with_trace` moved to the `PropagationPolicy` trait,
   whose default reports only the root.
+- `mark_with` no longer does quadratic work when it follows cascades or
+  cross-channel edges. It walked every reached key's dependents again, and
+  re-ran `EagerPolicy` on keys an earlier step had already covered; marking the
+  head of a 4096-key DAG with a layout-to-paint cascade took 124 ms and now
+  takes under 1 ms. `PropagationPolicy` gains `marks_all_dependents` (default
+  `false`, `true` for `EagerPolicy`) so the tracker knows when re-running a
+  policy is redundant. The closure now visits pairs breadth-first, so the
+  first cause a trace records for a pair may differ from before.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
