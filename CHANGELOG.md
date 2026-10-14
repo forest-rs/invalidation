@@ -118,6 +118,13 @@ This release has an [MSRV][] of 1.88.
   `EagerPolicy` mark itself even without cascades or cross-channel edges.
   Marking a 4096-key DAG eagerly takes 108 µs instead of 138 µs, and 256 µs
   instead of 368 µs with a cascade, with less heap.
+- Traversals (`transitive_dependents`, `TraversalScratch`, affected-drain
+  expansion, targeted drains, and the cycle check in `add_dependency`) track
+  visited keys in a bitset while the keys are compact, rather than a hash set.
+  `transitive_dependents` over 4096 keys takes 48 µs instead of 129 µs and
+  1 KB of heap instead of 62 KB; a lazy mark and affected drain takes 107 µs
+  instead of 312 µs; building a 1024-key DAG with cycle checks takes half
+  the time.
 - `Debug` for `InvalidationTracker`, `InvalidationGraph`, `InvalidationSet`,
   `ChannelCascade`, and `CrossChannelEdges` shows only channels in use, with
   edges as `from -> to`, instead of dumping 64 slots per direction.
