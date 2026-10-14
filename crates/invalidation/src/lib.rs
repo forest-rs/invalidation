@@ -131,7 +131,9 @@
 //!   immediately after marking. Use with [`InvalidationTracker::drain_sorted`].
 //! - [`LazyPolicy`]: Only marks the key itself at mark time; no propagation
 //!   occurs. Use [`InvalidationTracker::drain_affected_sorted`] to expand and process
-//!   all affected keys at drain time.
+//!   all affected keys at drain time; the tracker's drain also follows the
+//!   cascades and cross-channel edges of the keys it drains, marking their
+//!   targets as roots, so drain a channel before the channels it feeds.
 //!
 //! You can implement [`PropagationPolicy`] for custom strategies.
 //!
