@@ -44,6 +44,27 @@ fn bench_graph_construction(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_graph_cycle_checks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("graph_cycle_checks");
+    group.sample_size(20);
+    for n in [512_u32, 1_024, 2_048] {
+        group.throughput(Throughput::Elements(u64::from(n - 1)));
+        group.bench_with_input(BenchmarkId::new("checked_chain", n), &n, |b, &n| {
+            b.iter(|| {
+                let mut graph = InvalidationGraph::new();
+                graph.reserve_keys(LAYOUT, n as usize);
+                for key in 1..n {
+                    graph
+                        .add_dependency(key, key - 1, LAYOUT, CycleHandling::Error)
+                        .unwrap();
+                }
+                black_box(graph);
+            });
+        });
+    }
+    group.finish();
+}
+
 #[derive(Clone)]
 struct Lcg(u64);
 
@@ -456,6 +477,7 @@ criterion_group!(
     benches,
     bench_invalidation,
     bench_cross_channel,
-    bench_graph_construction
+    bench_graph_construction,
+    bench_graph_cycle_checks
 );
 criterion_main!(benches);
