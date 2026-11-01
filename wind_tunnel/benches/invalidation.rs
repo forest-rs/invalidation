@@ -5,7 +5,7 @@
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use invalidation::{
     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, InvalidationTracker,
     LazyPolicy, TraversalScratch, drain_sorted,
@@ -13,6 +13,30 @@ use invalidation::{
 
 const LAYOUT: Channel = Channel::new(0);
 const PAINT: Channel = Channel::new(1);
+
+fn build_chain_graph(n: u32) -> InvalidationGraph<u32> {
+    let mut graph = InvalidationGraph::new();
+    for key in 1..n {
+        graph
+            .add_dependency(key, key - 1, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+    }
+    graph
+}
+
+fn bench_graph_construction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("graph_construction");
+    group.sample_size(20);
+    for n in [1_024_u32, 9_000, 32_768] {
+        group.throughput(Throughput::Elements(u64::from(n - 1)));
+        group.bench_with_input(BenchmarkId::new("rising_chain", n), &n, |b, &n| {
+            // Construction belongs in the timed body: setup-only builds hid
+            // the cost of growing dense tables one key at a time.
+            b.iter(|| black_box(build_chain_graph(black_box(n))));
+        });
+    }
+    group.finish();
+}
 
 #[derive(Clone)]
 struct Lcg(u64);
@@ -422,5 +446,10 @@ fn bench_invalidation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_invalidation, bench_cross_channel);
+criterion_group!(
+    benches,
+    bench_invalidation,
+    bench_cross_channel,
+    bench_graph_construction
+);
 criterion_main!(benches);
