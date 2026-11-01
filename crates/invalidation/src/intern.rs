@@ -20,11 +20,12 @@
 //! #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 //! struct ResourceKey(&'static str);
 //!
-//! let mut ids = Interner::<ResourceKey>::new();
+//! let mut ids = Interner::<ResourceKey>::with_capacity(2);
 //! let a: InternId = ids.intern(ResourceKey("a"));
 //! let b: InternId = ids.intern(ResourceKey("b"));
 //!
 //! let mut tracker = InvalidationTracker::<InternId>::new();
+//! tracker.reserve_keys(LAYOUT, ids.len());
 //! tracker.add_dependency(b, a, LAYOUT).unwrap();
 //! tracker.mark_with(a, LAYOUT, &LazyPolicy);
 //!
@@ -106,6 +107,39 @@ where
         }
     }
 
+    /// Creates an empty interner with space for at least `capacity` keys.
+    ///
+    /// Preallocates the owned-key table and hash-bucket index. Each bucket's
+    /// candidate-id list still allocates as keys are interned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity. An
+    /// allocation failure is handled by the allocator.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: Vec::with_capacity(capacity),
+            buckets: HashMap::with_capacity(capacity),
+            build_hasher: DefaultHashBuilder::default(),
+        }
+    }
+
+    /// Reserves space for at least `additional` new distinct keys.
+    ///
+    /// Reserves the owned-key table and hash-bucket index without changing
+    /// existing keys or their [`InternId`] values. Candidate-id lists inside
+    /// buckets may still allocate. Existing storage is never shrunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity. An
+    /// allocation failure is handled by the allocator.
+    pub fn reserve(&mut self, additional: usize) {
+        self.keys.reserve(additional);
+        self.buckets.reserve(additional);
+    }
+
     /// Returns the number of interned keys.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -170,6 +204,59 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq, Hash)]
     struct Key(&'static str);
+
+    #[test]
+    fn reservation_preserves_ids_and_covers_additional_keys() {
+        let mut ids = Interner::with_capacity(16);
+        assert!(ids.is_empty());
+        let initial_capacities = (ids.keys.capacity(), ids.buckets.capacity());
+        for key in 0..16_u32 {
+            assert_eq!(ids.intern(key).as_u32(), key);
+        }
+        assert_eq!(
+            initial_capacities,
+            (ids.keys.capacity(), ids.buckets.capacity())
+        );
+
+        ids.reserve(32);
+        let capacities = (ids.keys.capacity(), ids.buckets.capacity());
+        for key in 0..48_u32 {
+            let id = ids.intern(key);
+            assert_eq!(id.as_u32(), key);
+            assert_eq!(ids.get(id), Some(&key));
+        }
+        assert_eq!(capacities, (ids.keys.capacity(), ids.buckets.capacity()));
+        assert_eq!(ids.len(), 48);
+        ids.clear();
+        ids.reserve(0);
+        assert_eq!(ids.intern(99).as_u32(), 0);
+        assert_eq!(capacities, (ids.keys.capacity(), ids.buckets.capacity()));
+    }
+
+    #[test]
+    fn reservation_keeps_colliding_keys_distinct() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Colliding(u32);
+
+        impl Hash for Colliding {
+            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+                0_u8.hash(state);
+            }
+        }
+
+        let mut ids = Interner::with_capacity(2);
+        let a = ids.intern(Colliding(1));
+        let b = ids.intern(Colliding(2));
+        ids.reserve(128);
+        let c = ids.intern(Colliding(3));
+        assert_eq!(ids.intern(Colliding(1)), a);
+        assert_eq!(ids.intern(Colliding(2)), b);
+        assert_eq!(ids.intern(Colliding(3)), c);
+        assert_eq!(ids.get(a), Some(&Colliding(1)));
+        assert_eq!(ids.get(b), Some(&Colliding(2)));
+        assert_eq!(ids.get(c), Some(&Colliding(3)));
+        assert_eq!(ids.len(), 3);
+    }
 
     #[test]
     fn interns_duplicates_to_same_id() {

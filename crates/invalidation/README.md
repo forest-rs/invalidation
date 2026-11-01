@@ -66,6 +66,10 @@ not the number of distinct keys. This reserves the selected channel's outer
 graph tables and shared channel caches; individual edge lists still allocate
 as dependencies are added. Standalone graphs expose the same method.
 
+Use `Interner::with_capacity(key_count)` for a known number of owned keys,
+or `interner.reserve(additional)` before adding another batch. Interned IDs
+remain stable across reservation.
+
 ## Eager vs Lazy
 
 Two workflows are intentionally first-class:
