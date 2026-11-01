@@ -1455,6 +1455,34 @@ mod tests {
     }
 
     #[test]
+    fn adjacency_grows_geometrically_for_rising_keys() {
+        // Rising keys must not grow any dense table's allocation once per key.
+        let mut graph = InvalidationGraph::<u32>::new();
+        let mut growths = [0; 4];
+        let mut capacities = [0; 4];
+        for key in 1..10_000_u32 {
+            graph
+                .add_dependency(key, key - 1, LAYOUT, CycleHandling::Allow)
+                .unwrap();
+            let now = [
+                graph.forward[LAYOUT.index() as usize].capacity(),
+                graph.reverse[LAYOUT.index() as usize].capacity(),
+                graph.forward_channels.capacity(),
+                graph.reverse_channels.capacity(),
+            ];
+            for i in 0..now.len() {
+                if now[i] != capacities[i] {
+                    growths[i] += 1;
+                    capacities[i] = now[i];
+                }
+            }
+        }
+        // Leave room for changes to Vec's growth factor while rejecting the
+        // former 9,999 capacity changes per table.
+        assert!(growths.iter().all(|&count| count <= 64), "{growths:?}");
+    }
+
+    #[test]
     #[should_panic(expected = "DenseKey index")]
     fn add_dependency_rejects_sparse_key_space() {
         let mut graph = InvalidationGraph::<usize>::new();

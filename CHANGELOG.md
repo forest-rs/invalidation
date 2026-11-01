@@ -13,6 +13,13 @@ You can find its changes [documented below](#030-2026-10-14).
 
 ## [Unreleased]
 
+### Fixed
+
+- The dependency graph's adjacency and channel tables use amortized growth.
+  Exact reservation for each new highest key could repeatedly reallocate and
+  copy the tables, making construction quadratic for keys arriving in
+  increasing order.
+
 ## [0.3.0][] (2026-10-14)
 
 This release has an [MSRV][] of 1.88.
