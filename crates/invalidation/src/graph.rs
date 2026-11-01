@@ -346,6 +346,12 @@ where
         channel: Channel,
         handling: CycleHandling,
     ) -> Result<AddDependency, CycleError<K>> {
+        // An existing edge cannot create a new cycle, even if the caller
+        // previously allowed one and now uses a stricter policy.
+        if self.dependencies(from, channel).any(|dep| dep == to) {
+            return Ok(AddDependency::AlreadyPresent);
+        }
+
         // Self-dependency is a trivial cycle
         if from == to {
             return self.handle_cycle(from, to, channel, handling);
@@ -360,12 +366,8 @@ where
         let from_idx = from.index();
         let to_idx = to.index();
 
-        // Dedup: check if already present
         let fwd = &mut self.forward[ch];
         grow(fwd, from_idx);
-        if fwd[from_idx].contains(&to) {
-            return Ok(AddDependency::AlreadyPresent);
-        }
 
         // Add forward edge
         fwd[from_idx].push(to);
@@ -1101,6 +1103,39 @@ mod tests {
     const LAYOUT: Channel = Channel::new(0);
     const PAINT: Channel = Channel::new(1);
     const A11Y: Channel = Channel::new(2);
+
+    #[test]
+    fn duplicate_dependency_does_not_recheck_an_existing_cycle() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph
+            .add_dependency(2, 1, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        graph
+            .add_dependency(1, 2, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        for handling in [
+            CycleHandling::Error,
+            CycleHandling::Ignore,
+            CycleHandling::DebugAssert,
+            CycleHandling::Allow,
+        ] {
+            assert_eq!(
+                graph.add_dependency(2, 1, LAYOUT, handling),
+                Ok(AddDependency::AlreadyPresent)
+            );
+        }
+        assert_eq!(graph.edge_count(LAYOUT), 2);
+        assert!(
+            graph
+                .add_dependency(3, 2, LAYOUT, CycleHandling::Error)
+                .is_ok()
+        );
+        assert!(
+            graph
+                .add_dependency(1, 3, LAYOUT, CycleHandling::Error)
+                .is_err()
+        );
+    }
 
     #[test]
     fn reserved_tables_cover_the_span_without_changing_the_graph() {
