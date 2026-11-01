@@ -13,23 +13,27 @@ You can find its changes [documented below](#030-2026-10-14).
 
 ## [Unreleased]
 
+## [0.3.1][] (2026-11-01)
+
+This release has an [MSRV][] of 1.88. Existing 0.3.0 callers need no changes.
+
 ### Added
 
 - Added `InvalidationGraph::reserve_keys` and
   `InvalidationTracker::reserve_keys` to reserve dense graph tables for a
-  known key span in one channel without adding keys or edges.
+  known key span in one channel without adding keys or edges. ([#20][] by [@waywardmonkeys][])
 - Added `Interner::with_capacity` and `Interner::reserve` to preallocate
-  owned-key and bucket tables without changing existing interned IDs.
+  owned-key and bucket tables without changing existing interned IDs. ([#20][] by [@waywardmonkeys][])
 - Added `InvalidationSet::reserve` and
   `InvalidationTracker::reserve_invalidated` to reserve pending-work capacity
-  per channel without marking keys or advancing the invalidation generation.
+  per channel without marking keys or advancing the invalidation generation. ([#20][] by [@waywardmonkeys][])
 
 ### Fixed
 
 - The dependency graph's adjacency and channel tables use amortized growth.
   Exact reservation for each new highest key could repeatedly reallocate and
   copy the tables, making construction quadratic for keys arriving in
-  increasing order.
+  increasing order. ([#20][] by [@waywardmonkeys][])
 
 ## [0.3.0][] (2026-10-14)
 
@@ -237,10 +241,12 @@ This release has an [MSRV][] of 1.92.
 This is the initial release.
 
 [#2]: https://github.com/forest-rs/invalidation/pull/2
+[#20]: https://github.com/forest-rs/invalidation/pull/20
 
 [@waywardmonkeys]: https://github.com/waywardmonkeys
 
-[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/forest-rs/invalidation/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/forest-rs/invalidation/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/forest-rs/invalidation/releases/tag/v0.3.0
 [0.2.0]: https://github.com/forest-rs/invalidation/releases/tag/v0.2.0
 [0.1.1]: https://github.com/forest-rs/invalidation/releases/tag/v0.1.1
