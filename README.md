@@ -55,6 +55,8 @@ as dependencies are added. Standalone graphs expose the same method.
 Use `Interner::with_capacity(key_count)` for a known number of owned keys,
 or `interner.reserve(additional)` before adding another batch. Interned IDs
 remain stable across reservation.
+Both the owned-key table and ID index are preallocated; interning the
+requested number of distinct keys does not grow either table.
 
 For a known batch of pending work, use
 `tracker.reserve_invalidated(channel, additional)` or the standalone

@@ -23,13 +23,16 @@ This release has an [MSRV][] of 1.88. Existing 0.3.0 callers need no changes.
   `InvalidationTracker::reserve_keys` to reserve dense graph tables for a
   known key span in one channel without adding keys or edges. ([#20][] by [@waywardmonkeys][])
 - Added `Interner::with_capacity` and `Interner::reserve` to preallocate
-  owned-key and bucket tables without changing existing interned IDs. ([#20][] by [@waywardmonkeys][])
+  owned-key and id tables without changing existing interned IDs. ([#20][] by [@waywardmonkeys][])
 - Added `InvalidationSet::reserve` and
   `InvalidationTracker::reserve_invalidated` to reserve pending-work capacity
   per channel without marking keys or advancing the invalidation generation. ([#20][] by [@waywardmonkeys][])
 
 ### Fixed
 
+- The interner indexes owned keys directly by ID instead of allocating a
+  candidate vector for each distinct hash. IDs, collision handling, and
+  key ownership remain unchanged. ([#20][] by [@waywardmonkeys][])
 - Cycle checks skip graph traversal when no existing dependency can reach
   the proposed dependent. Building rising-key chains with cycle checks no
   longer searches the growing chain for every new key. Checks for cycles

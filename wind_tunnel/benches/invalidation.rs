@@ -6,6 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use invalidation::intern::Interner;
 use invalidation::{
     Channel, CycleHandling, EagerPolicy, InvalidationGraph, InvalidationSet, InvalidationTracker,
     LazyPolicy, TraversalScratch, drain_sorted,
@@ -59,6 +60,63 @@ fn bench_graph_cycle_checks(c: &mut Criterion) {
                         .unwrap();
                 }
                 black_box(graph);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_interner(c: &mut Criterion) {
+    let mut group = c.benchmark_group("interner");
+    group.sample_size(20);
+    for n in [1_024_u32, 9_000] {
+        group.throughput(Throughput::Elements(u64::from(n)));
+        let owned_keys: Vec<String> = (0..n)
+            .map(|key| format!("scene/prim/{key}/material"))
+            .collect();
+        for reserve in [false, true] {
+            let integer_name = if reserve { "reserved_u32" } else { "u32" };
+            group.bench_with_input(BenchmarkId::new(integer_name, n), &n, |b, &n| {
+                b.iter(|| {
+                    let mut ids = if reserve {
+                        Interner::with_capacity(n as usize)
+                    } else {
+                        Interner::new()
+                    };
+                    for key in 0..n {
+                        black_box(ids.intern(black_box(key)));
+                    }
+                    black_box(ids);
+                });
+            });
+            let owned_name = if reserve { "reserved_owned" } else { "owned" };
+            group.bench_function(BenchmarkId::new(owned_name, n), |b| {
+                b.iter_batched(
+                    || owned_keys.clone(),
+                    |keys| {
+                        let mut ids = if reserve {
+                            Interner::with_capacity(keys.len())
+                        } else {
+                            Interner::new()
+                        };
+                        for key in keys {
+                            black_box(ids.intern(key));
+                        }
+                        black_box(ids);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+        let mut ids = Interner::with_capacity(n as usize);
+        for key in 0..n {
+            ids.intern(key);
+        }
+        group.bench_with_input(BenchmarkId::new("lookup_u32", n), &n, |b, &n| {
+            b.iter(|| {
+                for key in 0..n {
+                    black_box(ids.intern(black_box(key)));
+                }
             });
         });
     }
@@ -478,6 +536,7 @@ criterion_group!(
     bench_invalidation,
     bench_cross_channel,
     bench_graph_construction,
-    bench_graph_cycle_checks
+    bench_graph_cycle_checks,
+    bench_interner
 );
 criterion_main!(benches);
