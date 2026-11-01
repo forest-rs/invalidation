@@ -93,6 +93,25 @@
 //!   direct mark without same-channel graph traversal or cross-channel edge
 //!   traversal. It still applies same-key channel cascades.
 //!
+//! ## Reserving Graph Storage
+//!
+//! When importing a graph with a known dense key span, reserve its tables in
+//! each channel before adding edges:
+//!
+//! ```
+//! use invalidation::{Channel, InvalidationTracker};
+//!
+//! const LAYOUT: Channel = Channel::new(0);
+//! let mut tracker = InvalidationTracker::<u32>::new();
+//! tracker.reserve_keys(LAYOUT, 1_000); // Indices 0 through 999.
+//! tracker.add_dependency(999, 998, LAYOUT).unwrap();
+//! ```
+//!
+//! [`InvalidationTracker::reserve_keys`] reserves the channel's outer graph
+//! tables and shared channel caches. It adds no keys or edges; individual edge
+//! lists still allocate as dependencies are added. The span is the largest
+//! expected [`DenseKey::index`] plus one, not the number of distinct keys.
+//!
 //! ## Using Components Separately
 //!
 //! While [`InvalidationTracker`] coordinates the common workflow, you can also

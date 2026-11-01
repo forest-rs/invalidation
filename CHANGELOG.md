@@ -13,6 +13,12 @@ You can find its changes [documented below](#030-2026-10-14).
 
 ## [Unreleased]
 
+### Added
+
+- Added `InvalidationGraph::reserve_keys` and
+  `InvalidationTracker::reserve_keys` to reserve dense graph tables for a
+  known key span in one channel without adding keys or edges.
+
 ### Fixed
 
 - The dependency graph's adjacency and channel tables use amortized growth.

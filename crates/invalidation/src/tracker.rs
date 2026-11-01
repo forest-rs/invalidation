@@ -327,6 +327,21 @@ where
         }
     }
 
+    /// Reserves dense graph tables for `key_span` indices in `channel`.
+    ///
+    /// `key_span` is the highest expected [`DenseKey::index`] plus one. This
+    /// forwards to [`InvalidationGraph::reserve_keys`], leaving graph edges,
+    /// invalidation state, generation, and cycle handling unchanged.
+    /// Individual edge lists and cross-channel edges are not preallocated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity or the
+    /// allocator reports an allocation failure.
+    pub fn reserve_keys(&mut self, channel: Channel, key_span: usize) {
+        self.graph.reserve_keys(channel, key_span);
+    }
+
     /// Returns a reference to the underlying dependency graph.
     #[inline]
     #[must_use]
@@ -1602,6 +1617,21 @@ mod tests {
             invalidated.mark(key, channel);
             invalidated.mark(self.extra_key, channel);
         }
+    }
+
+    #[test]
+    fn graph_reservation_preserves_pending_work_and_cycle_handling() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.mark(1, LAYOUT);
+        let generation = tracker.generation();
+        tracker.reserve_keys(LAYOUT, 1_000);
+        assert_eq!(tracker.generation(), generation);
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert_eq!(tracker.graph().edge_count(LAYOUT), 1);
+        assert!(tracker.add_dependency(1, 2, LAYOUT).is_err());
+        let order: Vec<_> = tracker.drain_affected_sorted(LAYOUT).collect();
+        assert_eq!(order, vec![1, 2]);
     }
 
     #[test]
