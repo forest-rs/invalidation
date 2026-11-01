@@ -57,6 +57,17 @@ impl DenseKey for usize {
     }
 }
 
+/// Reserves room for `vec` to cover index `idx`, returning the length that
+/// does.
+///
+/// Uses `Vec`'s amortized reservation strategy to avoid growing the allocation
+/// once per key when indices arrive in increasing order. The growth factor
+/// and spare capacity are determined by `Vec`.
+///
+/// # Panics
+///
+/// If the length does not fit in memory: a key space too sparse for dense
+/// storage.
 #[inline]
 pub(crate) fn prepare_dense_growth<T>(vec: &mut Vec<T>, idx: usize, storage: &str) -> usize {
     let target_len = idx.checked_add(1).unwrap_or_else(|| {
@@ -64,7 +75,7 @@ pub(crate) fn prepare_dense_growth<T>(vec: &mut Vec<T>, idx: usize, storage: &st
     });
 
     if target_len > vec.len() {
-        vec.try_reserve_exact(target_len - vec.len()).unwrap_or_else(|err| {
+        vec.try_reserve(target_len - vec.len()).unwrap_or_else(|err| {
             panic!(
                 "DenseKey index {idx} requires growing {storage} to length {target_len}: {err:?}; use a compact dense key space or intern::Interner"
             )
