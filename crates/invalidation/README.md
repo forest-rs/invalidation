@@ -58,6 +58,14 @@ assert_eq!(ordered, vec![1, 2, 3]);
 - Use `intern::Interner` when your natural keys are strings or other non-`Copy`
   values.
 
+## Reserving Graph Storage
+
+For a known dense key span, call `tracker.reserve_keys(channel, key_span)`
+before adding edges. The span is the highest expected dense index plus one,
+not the number of distinct keys. This reserves the selected channel's outer
+graph tables and shared channel caches; individual edge lists still allocate
+as dependencies are added. Standalone graphs expose the same method.
+
 ## Eager vs Lazy
 
 Two workflows are intentionally first-class:

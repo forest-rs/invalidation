@@ -14,8 +14,11 @@ use invalidation::{
 const LAYOUT: Channel = Channel::new(0);
 const PAINT: Channel = Channel::new(1);
 
-fn build_chain_graph(n: u32) -> InvalidationGraph<u32> {
+fn build_chain_graph(n: u32, reserve: bool) -> InvalidationGraph<u32> {
     let mut graph = InvalidationGraph::new();
+    if reserve {
+        graph.reserve_keys(LAYOUT, n as usize);
+    }
     for key in 1..n {
         graph
             .add_dependency(key, key - 1, LAYOUT, CycleHandling::Allow)
@@ -32,7 +35,10 @@ fn bench_graph_construction(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("rising_chain", n), &n, |b, &n| {
             // Construction belongs in the timed body: setup-only builds hid
             // the cost of growing dense tables one key at a time.
-            b.iter(|| black_box(build_chain_graph(black_box(n))));
+            b.iter(|| black_box(build_chain_graph(black_box(n), false)));
+        });
+        group.bench_with_input(BenchmarkId::new("reserved_chain", n), &n, |b, &n| {
+            b.iter(|| black_box(build_chain_graph(black_box(n), true)));
         });
     }
     group.finish();

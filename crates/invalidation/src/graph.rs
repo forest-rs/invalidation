@@ -261,6 +261,52 @@ where
         }
     }
 
+    /// Reserves dense table storage for `key_span` indices in `channel`.
+    ///
+    /// `key_span` is the highest expected [`DenseKey::index`] plus one, not
+    /// the number of distinct keys. This reserves both adjacency tables for
+    /// the selected channel and the shared channel caches. Other channels'
+    /// adjacency tables remain unchanged.
+    ///
+    /// Reservation adds no keys or edges and never shrinks existing storage.
+    /// Individual edge lists still allocate as dependencies are added; this
+    /// does not reserve cross-channel edges or invalidation state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity or the
+    /// allocator reports an allocation failure.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use invalidation::{Channel, CycleHandling, InvalidationGraph};
+    ///
+    /// const LAYOUT: Channel = Channel::new(0);
+    /// let mut graph = InvalidationGraph::<u32>::new();
+    /// graph.reserve_keys(LAYOUT, 1_000);
+    /// graph.add_dependency(999, 998, LAYOUT, CycleHandling::Allow).unwrap();
+    /// assert_eq!(graph.edge_count(LAYOUT), 1);
+    /// ```
+    pub fn reserve_keys(&mut self, channel: Channel, key_span: usize) {
+        let Some(idx) = key_span.checked_sub(1) else {
+            return;
+        };
+        let ch = channel.index() as usize;
+        prepare_dense_growth(&mut self.forward[ch], idx, "dependency graph adjacency");
+        prepare_dense_growth(&mut self.reverse[ch], idx, "dependency graph adjacency");
+        prepare_dense_growth(
+            &mut self.forward_channels,
+            idx,
+            "dependency graph channel cache",
+        );
+        prepare_dense_growth(
+            &mut self.reverse_channels,
+            idx,
+            "dependency graph channel cache",
+        );
+    }
+
     /// Returns `true` if the graph has no dependencies.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1055,6 +1101,78 @@ mod tests {
     const LAYOUT: Channel = Channel::new(0);
     const PAINT: Channel = Channel::new(1);
     const A11Y: Channel = Channel::new(2);
+
+    #[test]
+    fn reserved_tables_cover_the_span_without_changing_the_graph() {
+        let mut graph = InvalidationGraph::<u32>::new();
+        graph.reserve_keys(LAYOUT, 0);
+        assert_eq!(graph.forward_channels.capacity(), 0);
+
+        graph.reserve_keys(LAYOUT, 1_000);
+        let capacities = [
+            graph.forward[LAYOUT.index() as usize].capacity(),
+            graph.reverse[LAYOUT.index() as usize].capacity(),
+            graph.forward_channels.capacity(),
+            graph.reverse_channels.capacity(),
+        ];
+        assert!(capacities.iter().all(|&capacity| capacity >= 1_000));
+        assert!(graph.is_empty());
+        assert_eq!(graph.keys().count(), 0);
+        assert!(graph.channels().is_empty());
+        for ch in 0..MAX_CHANNELS {
+            assert!(graph.forward[ch].is_empty());
+            assert!(graph.reverse[ch].is_empty());
+            if ch != LAYOUT.index() as usize {
+                assert_eq!(graph.forward[ch].capacity(), 0);
+                assert_eq!(graph.reverse[ch].capacity(), 0);
+            }
+        }
+
+        for key in 1..1_000 {
+            graph
+                .add_dependency(key, key - 1, LAYOUT, CycleHandling::Allow)
+                .unwrap();
+        }
+        graph.reserve_keys(LAYOUT, 100);
+        graph.reserve_keys(LAYOUT, 1_000);
+        assert_eq!(
+            capacities,
+            [
+                graph.forward[LAYOUT.index() as usize].capacity(),
+                graph.reverse[LAYOUT.index() as usize].capacity(),
+                graph.forward_channels.capacity(),
+                graph.reverse_channels.capacity(),
+            ]
+        );
+        assert_eq!(graph.edge_count(LAYOUT), 999);
+        assert_eq!(
+            graph.dependencies(999, LAYOUT).collect::<Vec<_>>(),
+            vec![998]
+        );
+        assert_eq!(graph.dependents(998, LAYOUT).collect::<Vec<_>>(), vec![999]);
+        assert_eq!(graph.dependency_channels(999), LAYOUT.into());
+        assert_eq!(graph.dependent_channels(998), LAYOUT.into());
+
+        graph.reserve_keys(PAINT, 2_000);
+        assert_eq!(graph.edge_count(LAYOUT), 999);
+        assert_eq!(graph.edge_count(PAINT), 0);
+        assert!(graph.forward[PAINT.index() as usize].capacity() >= 2_000);
+        assert!(graph.reverse[PAINT.index() as usize].capacity() >= 2_000);
+        graph
+            .add_dependency(1_999, 1_998, PAINT, CycleHandling::Allow)
+            .unwrap();
+        graph
+            .add_dependency(1_001, 1_000, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        assert_eq!(graph.edge_count(PAINT), 1);
+        assert_eq!(graph.edge_count(LAYOUT), 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "DenseKey index")]
+    fn reserve_keys_rejects_unaddressable_span() {
+        InvalidationGraph::<usize>::new().reserve_keys(LAYOUT, usize::MAX);
+    }
 
     #[test]
     fn add_and_query_dependencies() {
