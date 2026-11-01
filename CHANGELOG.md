@@ -30,6 +30,10 @@ This release has an [MSRV][] of 1.88. Existing 0.3.0 callers need no changes.
 
 ### Fixed
 
+- Re-adding an existing dependency returns `AddDependency::AlreadyPresent`
+  even when it belongs to a cycle previously permitted with
+  `CycleHandling::Allow`. Stricter policies used to reject the duplicate or
+  panic in debug builds, despite it adding no edge. ([#20][] by [@waywardmonkeys][])
 - The dependency graph's adjacency and channel tables use amortized growth.
   Exact reservation for each new highest key could repeatedly reallocate and
   copy the tables, making construction quadratic for keys arriving in

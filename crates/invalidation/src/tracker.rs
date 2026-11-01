@@ -444,6 +444,11 @@ where
             && from != to
             && let Some(flow) = self.crossing_flow(channel, (from, channel), (to, channel))
         {
+            // A cycle allowed earlier does not make re-adding an existing
+            // edge an error. Keep duplicate semantics aligned with the graph.
+            if self.graph.dependencies(from, channel).any(|dep| dep == to) {
+                return Ok(AddDependency::AlreadyPresent);
+            }
             return dependency_cycle(from, to, channel, flow, handling);
         }
         self.graph.add_dependency(from, to, channel, handling)
@@ -1633,6 +1638,29 @@ mod tests {
             invalidated.mark(key, channel);
             invalidated.mark(self.extra_key, channel);
         }
+    }
+
+    #[test]
+    fn duplicate_dependency_does_not_recheck_an_existing_cross_channel_cycle() {
+        let mut tracker = InvalidationTracker::<u32>::with_cycle_handling(CycleHandling::Error);
+        tracker.add_dependency(2, 1, LAYOUT).unwrap();
+        tracker.add_cross_dependency(2, LAYOUT, 3, PAINT).unwrap();
+        tracker
+            .add_cross_dependency_with(3, PAINT, 1, LAYOUT, CycleHandling::Allow)
+            .unwrap();
+        for handling in [
+            CycleHandling::Error,
+            CycleHandling::Ignore,
+            CycleHandling::DebugAssert,
+            CycleHandling::Allow,
+        ] {
+            assert_eq!(
+                tracker.add_dependency_with(2, 1, LAYOUT, handling),
+                Ok(AddDependency::AlreadyPresent)
+            );
+        }
+        assert_eq!(tracker.graph().edge_count(LAYOUT), 1);
+        assert_eq!(tracker.cross_channel().len(), 2);
     }
 
     #[test]
