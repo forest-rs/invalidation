@@ -342,6 +342,22 @@ where
         self.graph.reserve_keys(channel, key_span);
     }
 
+    /// Reserves space for `additional` more invalidated keys in `channel`.
+    ///
+    /// Forwards to [`InvalidationSet::reserve`] without marking keys,
+    /// propagating invalidation, or advancing [`generation`](Self::generation).
+    /// Reserve each affected channel separately when using cascades or
+    /// cross-channel edges. Graph storage is reserved by
+    /// [`reserve_keys`](Self::reserve_keys) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity. An
+    /// allocation failure is handled by the allocator.
+    pub fn reserve_invalidated(&mut self, channel: Channel, additional: usize) {
+        self.invalidated.reserve(channel, additional);
+    }
+
     /// Returns a reference to the underlying dependency graph.
     #[inline]
     #[must_use]
@@ -1632,6 +1648,24 @@ mod tests {
         assert!(tracker.add_dependency(1, 2, LAYOUT).is_err());
         let order: Vec<_> = tracker.drain_affected_sorted(LAYOUT).collect();
         assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn invalidation_reservation_does_not_mark_or_cascade() {
+        let mut tracker = InvalidationTracker::<u32>::new();
+        tracker.add_cascade(LAYOUT, PAINT).unwrap();
+        tracker.mark(7, PAINT);
+        let generation = tracker.generation();
+        tracker.reserve_invalidated(LAYOUT, 32);
+        tracker.reserve_invalidated(PAINT, 64);
+        assert_eq!(tracker.generation(), generation);
+        assert!(!tracker.is_invalidated(7, LAYOUT));
+        assert!(tracker.is_invalidated(7, PAINT));
+        assert_eq!(tracker.invalidated().len(PAINT), 1);
+        assert!(tracker.graph().is_empty());
+        tracker.mark(1, LAYOUT);
+        assert!(tracker.is_invalidated(1, LAYOUT));
+        assert!(tracker.is_invalidated(1, PAINT));
     }
 
     #[test]

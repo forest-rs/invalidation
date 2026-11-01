@@ -90,6 +90,20 @@ where
         }
     }
 
+    /// Reserves space for at least `additional` more invalidated keys in `channel`.
+    ///
+    /// Existing marks and other channels are unchanged. This does not advance
+    /// [`generation`](Self::generation), since reservation changes no
+    /// invalidation state. Clearing or draining the channel retains capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested storage exceeds addressable capacity. An
+    /// allocation failure is handled by the allocator.
+    pub fn reserve(&mut self, channel: Channel, additional: usize) {
+        self.channels[channel.index() as usize].reserve(additional);
+    }
+
     /// Returns the current operation generation.
     ///
     /// The generation advances on invalidation-state operations such as
@@ -282,6 +296,41 @@ mod tests {
 
     const LAYOUT: Channel = Channel::new(0);
     const PAINT: Channel = Channel::new(1);
+
+    #[test]
+    fn reservation_preserves_marks_generation_and_other_channels() {
+        let mut invalidated = InvalidationSet::new();
+        invalidated.reserve(LAYOUT, 0);
+        assert_eq!(invalidated.channels[LAYOUT.index() as usize].capacity(), 0);
+        invalidated.mark(99, LAYOUT);
+        let generation = invalidated.generation();
+        invalidated.reserve(LAYOUT, 32);
+        let capacity = invalidated.channels[LAYOUT.index() as usize].capacity();
+        assert_eq!(invalidated.generation(), generation);
+        assert!(invalidated.is_invalidated(99, LAYOUT));
+        assert_eq!(invalidated.len(LAYOUT), 1);
+        assert_eq!(invalidated.channels[PAINT.index() as usize].capacity(), 0);
+
+        for key in 0..32 {
+            invalidated.mark(key, LAYOUT);
+        }
+        assert_eq!(invalidated.len(LAYOUT), 33);
+        assert_eq!(
+            invalidated.channels[LAYOUT.index() as usize].capacity(),
+            capacity
+        );
+        assert_eq!(invalidated.drain(LAYOUT).count(), 33);
+        assert_eq!(
+            invalidated.channels[LAYOUT.index() as usize].capacity(),
+            capacity
+        );
+        invalidated.mark(100, LAYOUT);
+        invalidated.clear(LAYOUT);
+        assert_eq!(
+            invalidated.channels[LAYOUT.index() as usize].capacity(),
+            capacity
+        );
+    }
 
     #[test]
     fn mark_and_query() {

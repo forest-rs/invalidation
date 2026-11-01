@@ -11,6 +11,7 @@ fn main() {
     let mut tracker = InvalidationTracker::<u32>::new();
     // Dense IDs will reach 3, so reserve four slots in this channel's tables.
     tracker.reserve_keys(LAYOUT, 4);
+    tracker.reserve_invalidated(LAYOUT, 3);
 
     // 1 -> 2 -> 3 as dependency order, encoded as:
     // 2 depends on 1, 3 depends on 2.
