@@ -18,6 +18,8 @@ You can find its changes [documented below](#030-2026-10-14).
 - Added `InvalidationGraph::reserve_keys` and
   `InvalidationTracker::reserve_keys` to reserve dense graph tables for a
   known key span in one channel without adding keys or edges.
+- Added `Interner::with_capacity` and `Interner::reserve` to preallocate
+  owned-key and bucket tables without changing existing interned IDs.
 
 ### Fixed
 

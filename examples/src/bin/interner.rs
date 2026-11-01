@@ -11,12 +11,13 @@ const STYLE: Channel = Channel::new(0);
 struct ResourceKey(&'static str);
 
 fn main() {
-    let mut ids = Interner::<ResourceKey>::new();
+    let mut ids = Interner::<ResourceKey>::with_capacity(3);
     let styles = ids.intern(ResourceKey("styles.css"));
     let button = ids.intern(ResourceKey("button"));
     let card = ids.intern(ResourceKey("card"));
 
     let mut tracker = InvalidationTracker::new();
+    tracker.reserve_keys(STYLE, ids.len());
     tracker.add_dependency(button, styles, STYLE).unwrap();
     tracker.add_dependency(card, styles, STYLE).unwrap();
 
