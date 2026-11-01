@@ -80,7 +80,9 @@ Runnable examples:
   propagation and cross-channel edges.
 - `LazyPolicy` should usually be paired with affected drains, not
   `drain_sorted`.
-- Dense deterministic drains assume a compact key space.
+- Graph edges require compact, unique, stable dense indices. Distinct arena
+  generations must not share an index while both remain in related state;
+  intern the complete key when needed. Drains also support sparse isolated keys.
 - If you allow cycles, topological drains can stall. The stuck keys stay
   invalidated; `remaining_keys` on the drain names them.
 

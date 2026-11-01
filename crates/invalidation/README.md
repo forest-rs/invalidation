@@ -216,8 +216,9 @@ assert_eq!(affected, vec![stylesheet, button]);
 - `mark` does not follow graph dependents or cross-channel edges; use
   `mark_with` for the usual full-closure update path.
 - `LazyPolicy` and `drain_sorted` are usually the wrong pair.
-- Deterministic dense drains assume a compact key space; use `Interner` when
-  keys are sparse or structured.
+- Graph edges require compact, unique, stable dense indices. Distinct arena
+  generations must not share an index while both remain in related state;
+  intern the complete key when needed. Drains also support sparse isolated keys.
 - If cycles are allowed, topological drains can stall. The stuck keys stay
   invalidated; `remaining_keys` on the drain names them. The tracker also
   rejects cycles through cascades and cross-channel edges, which would make
