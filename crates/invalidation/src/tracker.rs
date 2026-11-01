@@ -3168,6 +3168,9 @@ mod tests {
     #[test]
     fn dependency_closing_a_cycle_through_other_channels_is_rejected() {
         let mut tracker = tracker_with_paint_feeding_layout(CycleHandling::Error);
+        // No same-channel path can reach 9 yet. A graph-only shortcut must
+        // still leave the tracker's cross-channel cycle check in place.
+        assert!(!tracker.graph().has_dependents(9, LAYOUT));
         // 9 lays out from 1: (1, L) -> (9, L) -> (9, P) -> (1, L).
         let err = tracker.add_dependency(9, 1, LAYOUT).unwrap_err();
         assert_eq!(

@@ -440,6 +440,13 @@ where
     ///
     /// This performs a DFS from `to` to see if `from` is reachable.
     fn would_create_cycle(&self, from: K, to: K, channel: Channel) -> bool {
+        // Self-dependencies were handled by the caller. Any other path to
+        // `from` must end in an existing edge into it. New dependents have no
+        // such edge, so ascending-key construction needs no traversal here.
+        if !self.has_dependents(from, channel) {
+            return false;
+        }
+
         // A cycle would be created if `from` is reachable from `to`
         // (i.e., `to` already transitively depends on `from`)
         let mut visited = KeySet::default();
@@ -1103,6 +1110,34 @@ mod tests {
     const LAYOUT: Channel = Channel::new(0);
     const PAINT: Channel = Channel::new(1);
     const A11Y: Channel = Channel::new(2);
+
+    #[test]
+    fn checked_chain_construction_does_linear_key_work() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        static INDEX_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        struct Key(u32);
+
+        impl DenseKey for Key {
+            fn index(self) -> usize {
+                INDEX_CALLS.fetch_add(1, Ordering::Relaxed);
+                self.0 as usize
+            }
+        }
+
+        const KEYS: u32 = 1_024;
+        let mut graph = InvalidationGraph::new();
+        for key in 1..KEYS {
+            graph
+                .add_dependency(Key(key), Key(key - 1), LAYOUT, CycleHandling::Error)
+                .unwrap();
+        }
+        let work = INDEX_CALLS.load(Ordering::Relaxed);
+        assert!(work <= 32 * KEYS as usize, "{work} index calls");
+        assert_eq!(graph.edge_count(LAYOUT), (KEYS - 1) as usize);
+    }
 
     #[test]
     fn duplicate_dependency_does_not_recheck_an_existing_cycle() {

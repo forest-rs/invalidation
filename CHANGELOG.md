@@ -30,6 +30,10 @@ This release has an [MSRV][] of 1.88. Existing 0.3.0 callers need no changes.
 
 ### Fixed
 
+- Cycle checks skip graph traversal when no existing dependency can reach
+  the proposed dependent. Building rising-key chains with cycle checks no
+  longer searches the growing chain for every new key. Checks for cycles
+  through other channels remain in place. ([#20][] by [@waywardmonkeys][])
 - Re-adding an existing dependency returns `AddDependency::AlreadyPresent`
   even when it belongs to a cycle previously permitted with
   `CycleHandling::Allow`. Stricter policies used to reject the duplicate or
