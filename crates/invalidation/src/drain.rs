@@ -29,17 +29,36 @@ use crate::trace::InvalidationTrace;
 /// drains keep in-degrees the same way while the keys they drain are compact,
 /// eliminating hashing from the hot path.
 ///
+/// # Index contract
+///
+/// For keys used together, equal keys must have equal indices and distinct
+/// keys must have distinct indices. An index must remain stable while the key
+/// is stored in a graph, invalidation set, or traversal state. These structures
+/// identify keys by index on their dense paths; aliasing or changing indices
+/// can merge unrelated keys, return incorrect edges, or lose pending work.
+///
+/// Arena keys that include a generation must not simply discard it when
+/// computing an index if different generations can coexist in these
+/// structures. Reuse an index only after its previous key has been removed
+/// from all related state, including reusable traversal scratch. Interning
+/// the complete arena key is another way to preserve its identity.
+///
+/// # Compactness
+///
 /// Keys with edges must map to compact sequential `usize` indices (typically
 /// starting from 0): the graph's storage grows with the largest index that
 /// has an edge, and very large indices panic if that storage would exceed
 /// addressable capacity or the available memory budget. Keys without edges
-/// can be anything. Use
+/// may have sparse indices, but must still obey the index contract. Use
 /// [`intern::Interner`](crate::intern::Interner) when your natural key space
 /// is not already compact.
 ///
-/// [`InternId`](crate::InternId) and `u32` implement this trait.
+/// [`InternId`](crate::InternId), `u32`, and `usize` implement this trait.
 pub trait DenseKey: Copy {
     /// Returns this key as a `usize` index for dense `Vec` storage.
+    ///
+    /// The mapping must preserve key identity and remain stable as described
+    /// in the [index contract](DenseKey#index-contract).
     fn index(self) -> usize;
 }
 

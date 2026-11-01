@@ -206,8 +206,9 @@
 //!   full-closure marking API.
 //! - [`LazyPolicy`] is usually paired with affected drains, not plain
 //!   [`drain_sorted`].
-//! - Deterministic dense drains assume a compact key space; intern sparse or
-//!   structured keys first.
+//! - Graph edges require compact, unique, stable [`DenseKey`] indices. Arena
+//!   generations must not alias while both remain in related state; intern the
+//!   complete key when needed. Drains also support sparse isolated keys.
 //! - If cycles are allowed, topological drains can stall. The stuck keys stay
 //!   invalidated; [`DrainSorted::remaining_keys`] names them. A cycle through
 //!   cross-channel edges does not stall a drain, but each affected drain then
