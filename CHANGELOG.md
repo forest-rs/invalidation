@@ -8,8 +8,8 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 # Changelog
 
-The latest published Invalidation release is [0.3.0](#030-2026-10-14) which was released on 2026-10-14.
-You can find its changes [documented below](#030-2026-10-14).
+The latest published Invalidation release is [0.3.1](#031-2026-11-01) which was released on 2026-11-01.
+You can find its changes [documented below](#031-2026-11-01).
 
 ## [Unreleased]
 
