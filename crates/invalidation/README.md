@@ -70,6 +70,12 @@ Use `Interner::with_capacity(key_count)` for a known number of owned keys,
 or `interner.reserve(additional)` before adding another batch. Interned IDs
 remain stable across reservation.
 
+For a known batch of pending work, use
+`tracker.reserve_invalidated(channel, additional)` or the standalone
+`InvalidationSet::reserve(channel, additional)`. Reservation does not mark
+keys or advance the invalidation generation. Clearing and draining retain
+this capacity for later batches.
+
 ## Eager vs Lazy
 
 Two workflows are intentionally first-class:

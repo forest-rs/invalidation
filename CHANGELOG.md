@@ -20,6 +20,9 @@ You can find its changes [documented below](#030-2026-10-14).
   known key span in one channel without adding keys or edges.
 - Added `Interner::with_capacity` and `Interner::reserve` to preallocate
   owned-key and bucket tables without changing existing interned IDs.
+- Added `InvalidationSet::reserve` and
+  `InvalidationTracker::reserve_invalidated` to reserve pending-work capacity
+  per channel without marking keys or advancing the invalidation generation.
 
 ### Fixed
 

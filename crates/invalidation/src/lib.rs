@@ -112,6 +112,12 @@
 //! lists still allocate as dependencies are added. The span is the largest
 //! expected [`DenseKey::index`] plus one, not the number of distinct keys.
 //!
+//! For owned keys, [`intern::Interner::with_capacity`] and
+//! [`intern::Interner::reserve`] preallocate the key table and bucket index.
+//! For pending work, [`InvalidationTracker::reserve_invalidated`] and
+//! [`InvalidationSet::reserve`] reserve additional entries in one channel
+//! without marking keys or advancing the invalidation generation.
+//!
 //! ## Using Components Separately
 //!
 //! While [`InvalidationTracker`] coordinates the common workflow, you can also
